@@ -13,7 +13,7 @@ from matplotlib.colors import to_hex
 from matplotlib.backends.backend_agg import FigureCanvasAgg
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg, NavigationToolbar2QT
 from matplotlib.figure import Figure
-from matplotlib.patches import Rectangle
+from matplotlib.patches import Ellipse, Rectangle
 from matplotlib.transforms import Affine2D, Bbox, IdentityTransform
 import pandas as pd
 from PySide6.QtCore import QEvent, Qt, QTimer, Signal
@@ -435,7 +435,7 @@ class GraphDrawerWindow(QMainWindow):
         box = QGroupBox("Origin-style columns")
         layout = QFormLayout(box)
         self.y_list = QListWidget()
-        self.y_list.setSelectionMode(QListWidget.NoSelection)
+        self.y_list.setSelectionMode(QAbstractItemView.SingleSelection)
         self.y_list.setMaximumHeight(140)
         hint = QLabel("Set table Role row to X/Y. Each Y uses the nearest X on its left.")
         hint.setWordWrap(True)
@@ -550,11 +550,12 @@ class GraphDrawerWindow(QMainWindow):
         layout = QVBoxLayout(box)
 
         self.annotation_list = QListWidget()
-        self.annotation_list.setMaximumHeight(70)
+        self.annotation_list.setMinimumHeight(120)
+        self.annotation_list.setMaximumHeight(180)
         self.annotation_list.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.annotation_list.installEventFilter(self)
         self.annotation_kind_combo = NoWheelComboBox()
-        self.annotation_kind_combo.addItems(["text", "line", "arrow", "box", "textbox"])
+        self.annotation_kind_combo.addItems(["text", "line", "arrow", "box", "circle", "textbox"])
         self.annotation_text_edit = AnnotationTextEdit()
         self.annotation_x_spin = self._double_spin(0.0, -1e12, 1e12, 4)
         self.annotation_y_spin = self._double_spin(0.0, -1e12, 1e12, 4)
@@ -568,7 +569,7 @@ class GraphDrawerWindow(QMainWindow):
         self.annotation_line_style_combo = NoWheelComboBox()
         self.annotation_line_style_combo.addItems(ANNOTATION_LINE_STYLES)
         self.annotation_alpha_spin = self._double_spin(1.0, 0.0, 1.0, 2)
-        self.annotation_fill_check = QCheckBox("Fill box")
+        self.annotation_fill_check = QCheckBox("Fill shape")
         self.annotation_color_btn = QPushButton("#000000")
         self.annotation_color_btn.setStyleSheet("background-color: #000000; color: white;")
         self.add_annotation_btn = QPushButton("Add annotation")
@@ -917,6 +918,7 @@ class GraphDrawerWindow(QMainWindow):
         self.center_content_btn.clicked.connect(self.center_content)
         self.fit_canvas_btn.clicked.connect(self.fit_canvas_to_content)
         self.y_list.itemChanged.connect(self.handle_plot_y_changed)
+        self.y_list.itemClicked.connect(self.handle_plot_y_clicked)
         self.style_target_combo.currentTextChanged.connect(self.handle_style_target_changed)
         self.plot_type_combo.currentTextChanged.connect(self.update_plot_type_help)
         self.preset_combo.currentTextChanged.connect(self.handle_preset_changed)
@@ -1681,6 +1683,24 @@ class GraphDrawerWindow(QMainWindow):
         self.refresh_cmap_column_list()
         self.schedule_render()
 
+    def handle_plot_y_clicked(self, item: QListWidgetItem) -> None:
+        if item is None:
+            return
+        QTimer.singleShot(0, lambda column=item.text(): self.select_series_for_y_column(column))
+
+    def select_series_for_y_column(self, y_column: str) -> None:
+        if not y_column or y_column not in self.checked_y_columns():
+            self.set_status("Check a Y column to plot and edit its series.")
+            return
+        if y_column not in self.series_by_y:
+            x_column = self._nearest_left_x(y_column)
+            if not x_column:
+                return
+            self.series_by_y[y_column] = default_series(x_column, y_column, len(self.series_by_y))
+        self.style_target_combo.setCurrentText(y_column)
+        self._load_series_into_widgets(self.series_by_y[y_column])
+        self.set_status(f"Editing series: {y_column}")
+
     def update_style_targets(self) -> None:
         current = self.style_target_combo.currentText()
         plotted = self.checked_y_columns()
@@ -2001,7 +2021,7 @@ class GraphDrawerWindow(QMainWindow):
         kind = self.annotation_kind_combo.currentText()
         if kind in {"line", "arrow"}:
             x, y, width, height = 0.35, 0.72, 0.18, -0.18
-        elif kind == "box":
+        elif kind in {"box", "circle"}:
             x, y, width, height = 0.38, 0.56, 0.16, 0.16
         else:
             x, y = 0.42, 0.68
@@ -2159,8 +2179,10 @@ class GraphDrawerWindow(QMainWindow):
         selected = set(self.selected_annotation_indices())
         self.annotation_list.blockSignals(True)
         self.annotation_list.clear()
-        for annotation in self.annotations:
-            self.annotation_list.addItem(self.annotation_list_label(annotation))
+        for idx, annotation in enumerate(self.annotations):
+            item = QListWidgetItem(self.annotation_list_label(annotation, idx))
+            item.setToolTip(self.annotation_list_tooltip(annotation, idx))
+            self.annotation_list.addItem(item)
         if self.annotations:
             self.annotation_list.setCurrentRow(min(max(current, 0), len(self.annotations) - 1))
             for idx in selected:
@@ -2168,13 +2190,29 @@ class GraphDrawerWindow(QMainWindow):
                     self.annotation_list.item(idx).setSelected(True)
         self.annotation_list.blockSignals(False)
 
-    def annotation_list_label(self, annotation: AnnotationConfig) -> str:
-        label = annotation.text.strip() or annotation.kind
-        return f"{annotation.kind}: {label}"
+    def annotation_list_label(self, annotation: AnnotationConfig, index: int | None = None) -> str:
+        prefix = f"{index + 1}. " if index is not None else ""
+        text = " ".join(annotation.text.strip().split()) or annotation.kind
+        if len(text) > 28:
+            text = text[:25] + "..."
+        return f"{prefix}{annotation.kind} | {text} | x={annotation.x:.3f}, y={annotation.y:.3f}"
+
+    def annotation_list_tooltip(self, annotation: AnnotationConfig, index: int | None = None) -> str:
+        prefix = f"Annotation {index + 1}\n" if index is not None else ""
+        text = annotation.text.strip() or "(no text)"
+        return (
+            f"{prefix}"
+            f"Type: {annotation.kind}\n"
+            f"Text: {text}\n"
+            f"Position: x={annotation.x:.4f}, y={annotation.y:.4f}\n"
+            f"Size: width={annotation.width:.4f}, height={annotation.height:.4f}"
+        )
 
     def update_annotation_list_item(self, row: int) -> None:
         if 0 <= row < len(self.annotations) and row < self.annotation_list.count():
-            self.annotation_list.item(row).setText(self.annotation_list_label(self.annotations[row]))
+            item = self.annotation_list.item(row)
+            item.setText(self.annotation_list_label(self.annotations[row], row))
+            item.setToolTip(self.annotation_list_tooltip(self.annotations[row], row))
 
     def selected_annotation_indices(self) -> list[int]:
         rows = sorted({self.annotation_list.row(item) for item in self.annotation_list.selectedItems()})
@@ -2732,9 +2770,8 @@ class GraphDrawerWindow(QMainWindow):
             idx, mode = handle_hit
             self.start_annotation_drag(idx, event, mode)
             return
-        for idx in self.annotation_hit_order():
-            if not self.annotation_body_hit(idx, event):
-                continue
+        idx = self.best_annotation_hit(event)
+        if idx is not None:
             self.start_annotation_drag(idx, event, "move")
             return
         if self.start_plot_box_drag(event):
@@ -2748,11 +2785,19 @@ class GraphDrawerWindow(QMainWindow):
         return indices
 
     def annotation_body_hit(self, idx: int, event) -> bool:
-        if idx < 0 or idx >= len(self.annotation_artists) or event.x is None or event.y is None:
-            return False
-        artist = self.annotation_artists[idx]
-        contains, _ = artist.contains(event)
-        return contains or self.annotation_hit_test(idx, event.x, event.y)
+        return self.annotation_hit_distance(idx, event) is not None
+
+    def best_annotation_hit(self, event) -> int | None:
+        best_idx: int | None = None
+        best_distance: float | None = None
+        for idx in self.annotation_hit_order():
+            distance = self.annotation_hit_distance(idx, event)
+            if distance is None:
+                continue
+            if best_distance is None or distance < best_distance - 1e-9 or (abs(distance - best_distance) <= 1e-9 and idx > (best_idx or -1)):
+                best_idx = idx
+                best_distance = distance
+        return best_idx
 
     def start_plot_box_drag(self, event) -> bool:
         config = self.collect_plot_config()
@@ -2854,19 +2899,107 @@ class GraphDrawerWindow(QMainWindow):
         return float(x), float(y)
 
     def annotation_hit_test(self, index: int, x_px: float, y_px: float) -> bool:
+        return self.annotation_hit_distance_for_point(index, x_px, y_px) is not None
+
+    def annotation_hit_distance(self, index: int, event) -> float | None:
+        if event.x is None or event.y is None:
+            return None
+        return self.annotation_hit_distance_for_point(index, float(event.x), float(event.y))
+
+    def annotation_hit_distance_for_point(self, index: int, x_px: float, y_px: float) -> float | None:
         if index < 0 or index >= len(self.annotations):
-            return False
+            return None
         annotation = self.annotations[index]
-        start_x, start_y, width_px, height_px = self._annotation_display_geometry(annotation)
         if annotation.kind in {"text", "textbox"}:
-            width_px = max(abs(width_px), annotation.font_size * max(len(annotation.text), 4) * 0.45)
-            height_px = max(abs(height_px), annotation.font_size * 1.8)
-        margin = 6 if annotation.kind in {"line", "arrow"} else 4
-        left = min(start_x, start_x + width_px) - margin
-        right = max(start_x, start_x + width_px) + margin
-        bottom = min(start_y, start_y + height_px) - margin
-        top = max(start_y, start_y + height_px) + margin
-        return left <= x_px <= right and bottom <= y_px <= top
+            return self.text_annotation_hit_distance(index, x_px, y_px)
+        if annotation.kind in {"line", "arrow"}:
+            return self.line_annotation_hit_distance(annotation, x_px, y_px)
+        if annotation.kind == "circle":
+            return self.circle_annotation_hit_distance(annotation, x_px, y_px)
+        if annotation.kind == "box":
+            return self.box_annotation_hit_distance(annotation, x_px, y_px)
+        return None
+
+    def text_annotation_hit_distance(self, index: int, x_px: float, y_px: float) -> float | None:
+        if index >= len(self.annotation_artists) or self.canvas is None:
+            return None
+        artist = self.annotation_artists[index]
+        renderer = self.canvas.get_renderer()
+        bbox_patch = getattr(artist, "get_bbox_patch", lambda: None)()
+        bbox = bbox_patch.get_window_extent(renderer=renderer) if bbox_patch is not None else artist.get_window_extent(renderer=renderer)
+        padding = 4.0
+        if bbox.x0 - padding <= x_px <= bbox.x1 + padding and bbox.y0 - padding <= y_px <= bbox.y1 + padding:
+            if bbox.x0 <= x_px <= bbox.x1 and bbox.y0 <= y_px <= bbox.y1:
+                return 0.0
+            dx = max(bbox.x0 - x_px, 0.0, x_px - bbox.x1)
+            dy = max(bbox.y0 - y_px, 0.0, y_px - bbox.y1)
+            return math.hypot(dx, dy)
+        return None
+
+    def line_annotation_hit_distance(self, annotation: AnnotationConfig, x_px: float, y_px: float) -> float | None:
+        start_x, start_y, width_px, height_px = self._annotation_display_geometry(annotation)
+        end_x, end_y = self._rotated_endpoint(start_x, start_y, width_px, height_px, annotation.angle)
+        distance = self.point_to_segment_distance(x_px, y_px, start_x, start_y, end_x, end_y)
+        return distance if distance <= 8.0 else None
+
+    def box_annotation_hit_distance(self, annotation: AnnotationConfig, x_px: float, y_px: float) -> float | None:
+        start_x, start_y, width_px, height_px = self._annotation_display_geometry(annotation)
+        local_x, local_y = self.annotation_local_point(x_px, y_px, start_x, start_y, annotation.angle)
+        left, right = sorted((0.0, width_px))
+        bottom, top = sorted((0.0, height_px))
+        inside = left <= local_x <= right and bottom <= local_y <= top
+        border_distance = self.rectangle_border_distance(local_x, local_y, left, right, bottom, top)
+        tolerance = 7.0
+        if annotation.fill and inside:
+            return 0.0
+        if border_distance <= tolerance:
+            return border_distance
+        return None
+
+    def circle_annotation_hit_distance(self, annotation: AnnotationConfig, x_px: float, y_px: float) -> float | None:
+        start_x, start_y, width_px, height_px = self._annotation_display_geometry(annotation)
+        center_x = start_x + width_px / 2
+        center_y = start_y + height_px / 2
+        local_x, local_y = self.annotation_local_point(x_px, y_px, center_x, center_y, annotation.angle)
+        rx = abs(width_px) / 2
+        ry = abs(height_px) / 2
+        if rx <= 1e-9 or ry <= 1e-9:
+            return None
+        normalized = math.hypot(local_x / rx, local_y / ry)
+        boundary_distance = abs(normalized - 1.0) * min(rx, ry)
+        if annotation.fill and normalized <= 1.0:
+            return 0.0
+        return boundary_distance if boundary_distance <= 7.0 else None
+
+    def annotation_local_point(self, x_px: float, y_px: float, origin_x: float, origin_y: float, angle: float) -> tuple[float, float]:
+        dx = x_px - origin_x
+        dy = y_px - origin_y
+        if not angle:
+            return dx, dy
+        radians = math.radians(-angle)
+        cos_a = math.cos(radians)
+        sin_a = math.sin(radians)
+        return dx * cos_a - dy * sin_a, dx * sin_a + dy * cos_a
+
+    @staticmethod
+    def point_to_segment_distance(px: float, py: float, x1: float, y1: float, x2: float, y2: float) -> float:
+        dx = x2 - x1
+        dy = y2 - y1
+        length_sq = dx * dx + dy * dy
+        if length_sq <= 1e-12:
+            return math.hypot(px - x1, py - y1)
+        t = max(0.0, min(1.0, ((px - x1) * dx + (py - y1) * dy) / length_sq))
+        nearest_x = x1 + t * dx
+        nearest_y = y1 + t * dy
+        return math.hypot(px - nearest_x, py - nearest_y)
+
+    @staticmethod
+    def rectangle_border_distance(x: float, y: float, left: float, right: float, bottom: float, top: float) -> float:
+        if left <= x <= right and bottom <= y <= top:
+            return min(abs(x - left), abs(x - right), abs(y - bottom), abs(y - top))
+        nearest_x = max(left, min(right, x))
+        nearest_y = max(bottom, min(top, y))
+        return math.hypot(x - nearest_x, y - nearest_y)
 
     def annotation_handle_hit_test(self, x_px: float, y_px: float) -> tuple[int, str] | None:
         idx = self.annotation_list.currentRow()
@@ -3068,6 +3201,12 @@ class GraphDrawerWindow(QMainWindow):
             artist.set_width(width_px)
             artist.set_height(height_px)
             artist.set_transform(Affine2D().rotate_deg_around(start_x, start_y, annotation.angle) + IdentityTransform())
+        elif annotation.kind == "circle":
+            start_x, start_y, width_px, height_px = self._annotation_display_geometry(annotation)
+            artist.center = (start_x + width_px / 2, start_y + height_px / 2)
+            artist.width = abs(width_px)
+            artist.height = abs(height_px)
+            artist.angle = annotation.angle
         else:
             artist.set_position((annotation.x, annotation.y))
             artist.set_rotation(annotation.angle)
@@ -3090,16 +3229,29 @@ class GraphDrawerWindow(QMainWindow):
             return
         annotation = self.annotations[idx]
         start_x, start_y, width_px, height_px = self._annotation_display_geometry(annotation)
-        outline = Rectangle(
-            (start_x, start_y),
-            width_px,
-            height_px,
-            linewidth=0.8,
-            edgecolor="#222222",
-            facecolor="none",
-            linestyle="--",
-            transform=Affine2D().rotate_deg_around(start_x, start_y, annotation.angle) + IdentityTransform(),
-        )
+        if annotation.kind == "circle":
+            outline = Ellipse(
+                (start_x + width_px / 2, start_y + height_px / 2),
+                width=abs(width_px),
+                height=abs(height_px),
+                angle=annotation.angle,
+                linewidth=0.8,
+                edgecolor="#222222",
+                facecolor="none",
+                linestyle="--",
+                transform=IdentityTransform(),
+            )
+        else:
+            outline = Rectangle(
+                (start_x, start_y),
+                width_px,
+                height_px,
+                linewidth=0.8,
+                edgecolor="#222222",
+                facecolor="none",
+                linestyle="--",
+                transform=Affine2D().rotate_deg_around(start_x, start_y, annotation.angle) + IdentityTransform(),
+            )
         self.annotation_handle_artists.append(outline)
         ax.add_artist(outline)
         for mode, (x_px, y_px) in self.annotation_handle_points(annotation).items():

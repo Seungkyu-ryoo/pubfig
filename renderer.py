@@ -9,7 +9,7 @@ from typing import Any
 
 import matplotlib as mpl
 from matplotlib.figure import Figure
-from matplotlib.patches import FancyArrowPatch, Rectangle
+from matplotlib.patches import Ellipse, FancyArrowPatch, Rectangle
 from matplotlib.ticker import AutoMinorLocator, LogLocator, MultipleLocator, NullLocator
 from matplotlib.transforms import Affine2D, IdentityTransform
 import pandas as pd
@@ -506,6 +506,24 @@ def _draw_annotations(ax, annotations: list[AnnotationConfig]) -> list[Any]:
                 linestyle=line_style,
                 alpha=(0.18 if annotation.fill else 1.0) * alpha,
                 transform=Affine2D().rotate_deg_around(start_x, start_y, annotation.angle) + IdentityTransform(),
+            )
+            ax.add_patch(patch)
+            patch.set_clip_on(False)
+            patch.set_in_layout(False)
+            patch.set_picker(True)
+            artists.append(patch)
+        elif annotation.kind == "circle":
+            patch = Ellipse(
+                (start_x + width_px / 2, start_y + height_px / 2),
+                width=abs(width_px),
+                height=abs(height_px),
+                angle=annotation.angle,
+                linewidth=1.0,
+                edgecolor=annotation.color,
+                facecolor=annotation.color if annotation.fill else "none",
+                linestyle=line_style,
+                alpha=(0.18 if annotation.fill else 1.0) * alpha,
+                transform=IdentityTransform(),
             )
             ax.add_patch(patch)
             patch.set_clip_on(False)
