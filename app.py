@@ -58,6 +58,7 @@ from plot_config import (
     MARKERS,
     PLOT_TYPES,
     PRESETS,
+    RECOMMENDED_PALETTES,
     AnnotationConfig,
     PlotConfig,
     SeriesConfig,
@@ -469,6 +470,9 @@ class GraphDrawerWindow(QMainWindow):
         self.cmap_start_spin = self._double_spin(0.05, 0.0, 1.0, 3)
         self.cmap_end_spin = self._double_spin(0.95, 0.0, 1.0, 3)
         self.apply_cmap_btn = QPushButton("Apply colormap to plotted series")
+        self.palette_combo = NoWheelComboBox()
+        self.palette_combo.addItems(list(RECOMMENDED_PALETTES.keys()))
+        self.apply_palette_btn = QPushButton("Apply recommended palette")
 
         tabs = QTabWidget()
         layout.addWidget(tabs)
@@ -532,6 +536,11 @@ class GraphDrawerWindow(QMainWindow):
         cmap_layout.addWidget(self.cmap_alpha_section)
         cmap_layout.addWidget(self.cmap_color_section)
         cmap_layout.addWidget(self.apply_cmap_btn)
+        palette_form = QFormLayout()
+        palette_form.setContentsMargins(0, 0, 0, 0)
+        palette_form.addRow("Recommended palette", self.palette_combo)
+        cmap_layout.addLayout(palette_form)
+        cmap_layout.addWidget(self.apply_palette_btn)
         self.cmap_alpha_section.setVisible(False)
         tabs.addTab(cmap_tab, "Colormap")
         return box
@@ -654,6 +663,9 @@ class GraphDrawerWindow(QMainWindow):
         self.x_tick_interval_edit = QLineEdit()
         self.y_tick_interval_edit = QLineEdit()
         self.y2_tick_interval_edit = QLineEdit()
+        self.x_minor_divisions_spin = self._int_spin(self.plot_config.x_minor_divisions, 0, 20)
+        self.y_minor_divisions_spin = self._int_spin(self.plot_config.y_minor_divisions, 0, 20)
+        self.y2_minor_divisions_spin = self._int_spin(self.plot_config.y2_minor_divisions, 0, 20)
         self.y_break_check = QCheckBox("Y broken axis")
         self.y_break_check.setChecked(self.plot_config.y_break_enabled)
         self.y_break_lower_min_edit = QLineEdit()
@@ -747,8 +759,11 @@ class GraphDrawerWindow(QMainWindow):
         axes_form.addRow("Y2 min", self.y2_min_edit)
         axes_form.addRow("Y2 max", self.y2_max_edit)
         axes_form.addRow("X tick interval", self.x_tick_interval_edit)
+        axes_form.addRow("X minor divisions", self.x_minor_divisions_spin)
         axes_form.addRow("Y tick interval", self.y_tick_interval_edit)
+        axes_form.addRow("Y minor divisions", self.y_minor_divisions_spin)
         axes_form.addRow("Y2 tick interval", self.y2_tick_interval_edit)
+        axes_form.addRow("Y2 minor divisions", self.y2_minor_divisions_spin)
         axes_form.addRow(self.y_break_check)
         axes_form.addRow("Break lower min", self.y_break_lower_min_edit)
         axes_form.addRow("Break lower max", self.y_break_lower_max_edit)
@@ -919,6 +934,7 @@ class GraphDrawerWindow(QMainWindow):
         self.y2_axis_color_btn.clicked.connect(self.choose_y2_axis_color)
         self.add_annotation_btn.clicked.connect(self.add_annotation)
         self.remove_annotation_btn.clicked.connect(self.remove_selected_annotation)
+        self.apply_palette_btn.clicked.connect(self.apply_recommended_palette_to_series)
         self.annotation_list.currentRowChanged.connect(self.update_annotation_inputs)
         for widget in (
             self.annotation_kind_combo,
@@ -993,8 +1009,11 @@ class GraphDrawerWindow(QMainWindow):
             self.y2_min_edit,
             self.y2_max_edit,
             self.x_tick_interval_edit,
+            self.x_minor_divisions_spin,
             self.y_tick_interval_edit,
+            self.y_minor_divisions_spin,
             self.y2_tick_interval_edit,
+            self.y2_minor_divisions_spin,
             self.y_break_check,
             self.y_break_lower_min_edit,
             self.y_break_lower_max_edit,
@@ -1765,11 +1784,7 @@ class GraphDrawerWindow(QMainWindow):
         self.update_undo_baseline()
 
     def apply_colormap_to_plotted_series(self) -> None:
-        selected = [
-            self.cmap_column_list.item(i).text()
-            for i in range(self.cmap_column_list.count())
-            if self.cmap_column_list.item(i).checkState() == Qt.Checked
-        ]
+        selected = self.selected_cmap_columns()
         if not selected:
             self.set_status("Select at least one series in the column list.")
             return
@@ -1812,6 +1827,46 @@ class GraphDrawerWindow(QMainWindow):
             self.set_status(f"Applied {self.cmap_combo.currentText()} colormap to {count} series.")
         self.schedule_render()
         self.update_undo_baseline()
+
+    def apply_recommended_palette_to_series(self) -> None:
+        selected = self.selected_cmap_columns()
+        if not selected:
+            self.set_status("Select at least one series in the column list.")
+            return
+        palette_name = self.palette_combo.currentText()
+        colors = self.recommended_colors(palette_name, len(selected))
+        if not colors:
+            self.set_status("Choose a recommended palette first.")
+            return
+        self.push_current_undo_state()
+        for idx, y_column in enumerate(selected):
+            series = self.series_by_y.get(y_column)
+            if series is None:
+                x_column = self._nearest_left_x(y_column)
+                series = default_series(x_column, y_column, idx)
+                self.series_by_y[y_column] = series
+            series.color = colors[idx]
+        target = self.style_target_combo.currentText()
+        if target in self.series_by_y:
+            self._set_color_button(self.series_by_y[target].color)
+        self.schedule_render()
+        self.update_undo_baseline()
+        self.set_status(f"Applied {palette_name} palette to {len(selected)} series.")
+
+    def selected_cmap_columns(self) -> list[str]:
+        return [
+            self.cmap_column_list.item(i).text()
+            for i in range(self.cmap_column_list.count())
+            if self.cmap_column_list.item(i).checkState() == Qt.Checked
+        ]
+
+    def recommended_colors(self, palette_name: str, count: int) -> list[str]:
+        palette = RECOMMENDED_PALETTES.get(palette_name, [])
+        if count <= 0 or not palette:
+            return []
+        if count <= len(palette):
+            return palette[:count]
+        return [palette[idx % len(palette)] for idx in range(count)]
 
     @staticmethod
     def _alpha_dist(t: float, a_start: float, a_end: float, dist: str) -> float:
@@ -2314,6 +2369,9 @@ class GraphDrawerWindow(QMainWindow):
         self.plot_config.x_tick_interval = self._optional_float(self.x_tick_interval_edit)
         self.plot_config.y_tick_interval = self._optional_float(self.y_tick_interval_edit)
         self.plot_config.y2_tick_interval = self._optional_float(self.y2_tick_interval_edit)
+        self.plot_config.x_minor_divisions = self.x_minor_divisions_spin.value()
+        self.plot_config.y_minor_divisions = self.y_minor_divisions_spin.value()
+        self.plot_config.y2_minor_divisions = self.y2_minor_divisions_spin.value()
         self.plot_config.y_break_enabled = self.y_break_check.isChecked()
         self.plot_config.y_break_lower_min = self._optional_float(self.y_break_lower_min_edit)
         self.plot_config.y_break_lower_max = self._optional_float(self.y_break_lower_max_edit)
@@ -2626,6 +2684,7 @@ class GraphDrawerWindow(QMainWindow):
         self.current_figure.set_dpi(PREVIEW_DPI * scale)
         self.current_figure.set_size_inches(self.preview_figure_width_in, self.preview_figure_height_in, forward=False)
         self.canvas.setFixedSize(canvas_w, canvas_h)
+        self.refresh_annotation_artists()
         host_w = max(viewport.width(), canvas_w + margins.left() + margins.right(), toolbar_hint.width() + margins.left() + margins.right())
         host_h = max(
             viewport.height(),
@@ -3174,16 +3233,12 @@ class GraphDrawerWindow(QMainWindow):
         self.render_timer.stop()
         config = self.collect_plot_config()
         result = render_figure(self._plot_dataframe(), config, self.selected_series_configs())
+        export_figure(result.figure, path, config)
         self.current_figure = result.figure
         self.annotation_artists = result.annotation_artists
         self.legend_artist = result.legend_artist
         self._replace_canvas(result.figure)
         self.draw_annotation_handles()
-        try:
-            self.set_annotation_handles_visible(False)
-            export_figure(result.figure, path, config)
-        finally:
-            self.set_annotation_handles_visible(True)
         self.set_status(f"Exported figure: {path}")
 
     def set_annotation_handles_visible(self, visible: bool) -> None:
@@ -3349,8 +3404,11 @@ class GraphDrawerWindow(QMainWindow):
             self.y2_min_edit,
             self.y2_max_edit,
             self.x_tick_interval_edit,
+            self.x_minor_divisions_spin,
             self.y_tick_interval_edit,
+            self.y_minor_divisions_spin,
             self.y2_tick_interval_edit,
+            self.y2_minor_divisions_spin,
             self.y_break_check,
             self.y_break_lower_min_edit,
             self.y_break_lower_max_edit,
@@ -3403,8 +3461,11 @@ class GraphDrawerWindow(QMainWindow):
         self.y2_min_edit.setText("" if self.plot_config.y2_min is None else str(self.plot_config.y2_min))
         self.y2_max_edit.setText("" if self.plot_config.y2_max is None else str(self.plot_config.y2_max))
         self.x_tick_interval_edit.setText("" if self.plot_config.x_tick_interval is None else str(self.plot_config.x_tick_interval))
+        self.x_minor_divisions_spin.setValue(self.plot_config.x_minor_divisions)
         self.y_tick_interval_edit.setText("" if self.plot_config.y_tick_interval is None else str(self.plot_config.y_tick_interval))
+        self.y_minor_divisions_spin.setValue(self.plot_config.y_minor_divisions)
         self.y2_tick_interval_edit.setText("" if self.plot_config.y2_tick_interval is None else str(self.plot_config.y2_tick_interval))
+        self.y2_minor_divisions_spin.setValue(self.plot_config.y2_minor_divisions)
         self.y_break_check.setChecked(self.plot_config.y_break_enabled)
         self.y_break_lower_min_edit.setText("" if self.plot_config.y_break_lower_min is None else str(self.plot_config.y_break_lower_min))
         self.y_break_lower_max_edit.setText("" if self.plot_config.y_break_lower_max is None else str(self.plot_config.y_break_lower_max))

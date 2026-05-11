@@ -12,15 +12,90 @@ import pandas as pd
 SCHEMA_VERSION = 1
 
 PALETTE = [
-    "#4477AA",
-    "#EE6677",
-    "#228833",
-    "#CCBB44",
-    "#66CCEE",
-    "#AA3377",
-    "#BBBBBB",
     "#000000",
+    "#0072B2",
+    "#D55E00",
+    "#009E73",
+    "#CC79A7",
+    "#E69F00",
+    "#56B4E9",
+    "#666666",
 ]
+
+RECOMMENDED_PALETTES = {
+    "Colorblind safe": [
+        "#000000",
+        "#0072B2",
+        "#D55E00",
+        "#009E73",
+        "#CC79A7",
+        "#E69F00",
+        "#56B4E9",
+        "#666666",
+    ],
+    "Paul Tol Bright": [
+        "#4477AA",
+        "#EE6677",
+        "#228833",
+        "#CCBB44",
+        "#66CCEE",
+        "#AA3377",
+        "#BBBBBB",
+    ],
+    "Paul Tol Muted": [
+        "#332288",
+        "#88CCEE",
+        "#44AA99",
+        "#117733",
+        "#999933",
+        "#DDCC77",
+        "#CC6677",
+        "#882255",
+        "#AA4499",
+        "#DDDDDD",
+    ],
+    "Nature/Wong": [
+        "#0072B2",
+        "#D55E00",
+        "#009E73",
+        "#CC79A7",
+        "#E69F00",
+        "#56B4E9",
+        "#F0E442",
+        "#000000",
+    ],
+    "ColorBrewer Dark2": [
+        "#1B9E77",
+        "#D95F02",
+        "#7570B3",
+        "#E7298A",
+        "#66A61E",
+        "#E6AB02",
+        "#A6761D",
+        "#666666",
+    ],
+    "Tableau 10": [
+        "#4E79A7",
+        "#F28E2B",
+        "#59A14F",
+        "#E15759",
+        "#76B7B2",
+        "#EDC948",
+        "#B07AA1",
+        "#FF9DA7",
+        "#9C755F",
+        "#BAB0AC",
+    ],
+    "Grayscale print": [
+        "#000000",
+        "#444444",
+        "#777777",
+        "#999999",
+        "#BBBBBB",
+        "#666666",
+        "#222222",
+    ],
+}
 
 
 @dataclass(frozen=True)
@@ -130,6 +205,9 @@ class PlotConfig:
     x_tick_interval: float | None = None
     y_tick_interval: float | None = None
     y2_tick_interval: float | None = None
+    x_minor_divisions: int = 5
+    y_minor_divisions: int = 5
+    y2_minor_divisions: int = 5
     y_offset_step: float = 0.0
     y_break_enabled: bool = False
     y_break_lower_min: float | None = None

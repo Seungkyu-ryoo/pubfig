@@ -10,7 +10,7 @@ from typing import Any
 import matplotlib as mpl
 from matplotlib.figure import Figure
 from matplotlib.patches import FancyArrowPatch, Rectangle
-from matplotlib.ticker import AutoMinorLocator, MultipleLocator
+from matplotlib.ticker import AutoMinorLocator, LogLocator, MultipleLocator, NullLocator
 from matplotlib.transforms import Affine2D, IdentityTransform
 import pandas as pd
 
@@ -248,7 +248,6 @@ def render_figure(df: pd.DataFrame, config: PlotConfig, series_configs: list[Ser
     for axis in plot_axes + ([ax_right] if ax_right is not None else []):
         axis.tick_params(direction="in", top=True, right=True, labelsize=config.tick_size, width=0.5)
         axis.tick_params(which="minor", direction="in", top=True, right=True, width=0.4)
-        axis.minorticks_on()
 
         for side in ("top", "right", "bottom", "left"):
             axis.spines[side].set_visible(True)
@@ -278,11 +277,6 @@ def render_figure(df: pd.DataFrame, config: PlotConfig, series_configs: list[Ser
         ax_right.yaxis.label.set_color(config.y2_axis_color)
         ax_right.spines["right"].set_edgecolor(config.y2_axis_color)
 
-    if config.grid:
-        for plot_axis in plot_axes:
-            plot_axis.grid(True, which="major", linestyle="-", linewidth=0.4, alpha=0.25)
-            plot_axis.grid(True, which="minor", linestyle=":", linewidth=0.3, alpha=0.18)
-
     if broken_y and ax_upper is not None:
         ax.set_ylim(config.y_break_lower_min, config.y_break_lower_max)
         ax_upper.set_ylim(config.y_break_upper_min, config.y_break_upper_max)
@@ -301,6 +295,13 @@ def render_figure(df: pd.DataFrame, config: PlotConfig, series_configs: list[Ser
         ax.tick_params(axis="x", which="both", top=False, labelbottom=config.show_x_tick_labels)
     if ax_right is not None:
         _apply_tick_intervals(ax_right, config, warnings, "right")
+    for axis in plot_axes + ([ax_right] if ax_right is not None else []):
+        axis.tick_params(which="minor", direction="in", width=0.4, length=2.2)
+
+    if config.grid:
+        for plot_axis in plot_axes:
+            plot_axis.grid(True, which="major", linestyle="-", linewidth=0.4, alpha=0.25)
+            plot_axis.grid(True, which="minor", linestyle=":", linewidth=0.3, alpha=0.18)
 
     legend_artist = None
     if config.legend and plotted > 0:
@@ -699,18 +700,35 @@ def _apply_tick_intervals(ax, config: PlotConfig, warnings: list[str], side: str
             warnings.append("X tick interval is ignored on log scale.")
         elif config.x_tick_interval > 0:
             ax.xaxis.set_major_locator(MultipleLocator(config.x_tick_interval))
-            ax.xaxis.set_minor_locator(AutoMinorLocator())
         else:
             warnings.append("X tick interval must be positive.")
+    _apply_minor_locator(ax.xaxis, config.x_scale, config.x_minor_divisions)
 
     y_interval = config.y2_tick_interval if side == "right" else config.y_tick_interval
     y_scale = config.y2_scale if side == "right" else config.y_scale
+    y_minor_divisions = config.y2_minor_divisions if side == "right" else config.y_minor_divisions
     label = "Y2" if side == "right" else "Y"
     if y_interval is not None:
         if y_scale == "log":
             warnings.append(f"{label} tick interval is ignored on log scale.")
         elif y_interval > 0:
             ax.yaxis.set_major_locator(MultipleLocator(y_interval))
-            ax.yaxis.set_minor_locator(AutoMinorLocator())
         else:
             warnings.append(f"{label} tick interval must be positive.")
+    _apply_minor_locator(ax.yaxis, y_scale, y_minor_divisions)
+
+
+def _apply_minor_locator(axis_obj, scale: str, divisions: int) -> None:
+    divisions = max(0, int(divisions))
+    if divisions == 0:
+        axis_obj.set_minor_locator(NullLocator())
+    elif scale == "log":
+        axis_obj.set_minor_locator(LogLocator(base=10.0, subs=_log_minor_subs(divisions), numticks=100))
+    else:
+        axis_obj.set_minor_locator(AutoMinorLocator(divisions))
+
+
+def _log_minor_subs(divisions: int) -> tuple[float, ...]:
+    if divisions <= 1:
+        return ()
+    return tuple(10 ** (idx / divisions) for idx in range(1, divisions))
