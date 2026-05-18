@@ -24,7 +24,7 @@ PySide6 + Matplotlib GUI for making publication-style 2D figures from copied tab
 **Figure control**
 - Journal presets (Nature, ACS, Physical Review) in exact mm
 - Separate canvas size vs. plot box size; lockable aspect ratio
-- Broken Y axis, log scale, custom major tick intervals, and per-axis minor tick divisions
+- Broken X/Y axis, log scale, custom major tick intervals, and per-axis minor tick divisions
 - Publication-oriented default colors and recommended discrete palettes for multi-series plots
 - Draggable legend; copy style across figures
 

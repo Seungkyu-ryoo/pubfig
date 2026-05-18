@@ -105,9 +105,9 @@ class FigurePreset:
     height_mm: float
     dpi: int
     font_size: int = 8
-    axis_size: int = 8
-    tick_size: int = 7
-    legend_size: int = 7
+    axis_size: int = 7
+    tick_size: int = 6
+    legend_size: int = 6
 
 
 PRESETS: dict[str, FigurePreset] = {
@@ -151,6 +151,7 @@ class SeriesConfig:
     marker_size: float = 4.0
     y_offset: float = 0.0
     alpha: float = 1.0
+    force_opaque: bool = False
     show_in_legend: bool = True
 
 
@@ -184,18 +185,22 @@ class PlotConfig:
     y_label: str = ""
     y2_label: str = ""
     title_size: int = 9
-    axis_size: int = 8
-    tick_size: int = 7
-    legend_size: int = 7
+    axis_size: int = 7
+    tick_size: int = 6
+    legend_size: int = 6
     y_label_offset_mm: float = 10.0
+    y_axis_color: str = "#000000"
     y2_axis_color: str = "#000000"
-    grid: bool = True
+    grid: bool = False
     legend: bool = True
     legend_anchor_x: float | None = None
     legend_anchor_y: float | None = None
     x_scale: str = "linear"
     y_scale: str = "linear"
     y2_scale: str = "linear"
+    x_scale_divisor: float = 1.0
+    y_scale_divisor: float = 1.0
+    y2_scale_divisor: float = 1.0
     x_min: float | None = None
     x_max: float | None = None
     y_min: float | None = None
@@ -209,6 +214,12 @@ class PlotConfig:
     y_minor_divisions: int = 5
     y2_minor_divisions: int = 5
     y_offset_step: float = 0.0
+    x_break_enabled: bool = False
+    x_break_left_min: float | None = None
+    x_break_left_max: float | None = None
+    x_break_right_min: float | None = None
+    x_break_right_max: float | None = None
+    x_break_gap: float = 0.08
     y_break_enabled: bool = False
     y_break_lower_min: float | None = None
     y_break_lower_max: float | None = None
@@ -219,8 +230,8 @@ class PlotConfig:
     show_y_tick_labels: bool = True
     show_y2_tick_labels: bool = True
     fixed_plot_area: bool = True
-    plot_width_mm: float = 0.0
-    plot_height_mm: float = 0.0
+    plot_width_mm: float = 50.0
+    plot_height_mm: float = 50.0
     plot_ratio_locked: bool = False
     plot_ratio_preset: str = "Current"
     plot_aspect_ratio: float = 0.0

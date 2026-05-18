@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 from pathlib import Path
 import re
 from typing import Any
@@ -10,7 +11,7 @@ from typing import Any
 import matplotlib as mpl
 from matplotlib.figure import Figure
 from matplotlib.patches import Ellipse, FancyArrowPatch, Rectangle
-from matplotlib.ticker import AutoMinorLocator, LogLocator, MultipleLocator, NullLocator
+from matplotlib.ticker import AutoMinorLocator, FixedLocator, LogFormatterSciNotation, LogLocator, MultipleLocator, NullLocator
 from matplotlib.transforms import Affine2D, IdentityTransform
 import pandas as pd
 
@@ -88,8 +89,36 @@ def _use_broken_y_axis(config: PlotConfig, right_axis_needed: bool, warnings: li
     return True
 
 
+def _use_broken_x_axis(config: PlotConfig, right_axis_needed: bool, broken_y: bool, warnings: list[str]) -> bool:
+    if not config.x_break_enabled:
+        return False
+    if broken_y:
+        warnings.append("X broken axis is disabled when Y broken axis is active.")
+        return False
+    if right_axis_needed:
+        warnings.append("X broken axis is disabled when Y2 series are plotted.")
+        return False
+    if config.x_scale != "linear":
+        warnings.append("X broken axis is only available for linear X scale.")
+        return False
+    values = (
+        config.x_break_left_min,
+        config.x_break_left_max,
+        config.x_break_right_min,
+        config.x_break_right_max,
+    )
+    if any(value is None for value in values):
+        warnings.append("X broken axis needs left and right X ranges.")
+        return False
+    left_min, left_max, right_min, right_max = values
+    if not (left_min < left_max < right_min < right_max):
+        warnings.append("X broken axis ranges must be left min < left max < right min < right max.")
+        return False
+    return True
+
+
 def _plot_series(target_ax, x_values, y_values, series: SeriesConfig, color: str, label: str, plot_type: str) -> None:
-    alpha = series.alpha
+    alpha = 1.0 if series.force_opaque else series.alpha
     if plot_type == "scatter":
         target_ax.scatter(x_values, y_values, s=series.marker_size**2, color=color, marker=series.marker, label=label, alpha=alpha)
     elif plot_type == "bar":
@@ -108,7 +137,8 @@ def _plot_series(target_ax, x_values, y_values, series: SeriesConfig, color: str
     elif plot_type == "step":
         target_ax.step(x_values, y_values, where="mid", color=color, linewidth=series.line_width, label=label, alpha=alpha)
     elif plot_type == "area":
-        target_ax.fill_between(x_values, y_values, color=color, alpha=alpha * 0.5, label=label)
+        fill_alpha = alpha if series.force_opaque else alpha * 0.5
+        target_ax.fill_between(x_values, y_values, color=color, alpha=fill_alpha, label=label)
         target_ax.plot(x_values, y_values, color=color, linewidth=series.line_width, alpha=alpha)
     elif plot_type == "stem":
         markerline, stemlines, baseline = target_ax.stem(x_values, y_values, label=label)
@@ -145,12 +175,40 @@ def _plot_broken_y_series(
     _plot_series(target_ax, x_values, y_masked, series, color, label, plot_type)
 
 
+def _plot_broken_x_series(
+    target_ax,
+    x_values,
+    y_values,
+    series: SeriesConfig,
+    color: str,
+    label: str,
+    plot_type: str,
+    x_min: float,
+    x_max: float,
+) -> None:
+    in_range = (x_values >= x_min) & (x_values <= x_max)
+    if plot_type in {"scatter", "bar", "stem"}:
+        _plot_series(target_ax, x_values[in_range], y_values[in_range], series, color, label, plot_type)
+        return
+
+    y_masked = y_values.where(in_range)
+    _plot_series(target_ax, x_values, y_masked, series, color, label, plot_type)
+
+
 def _broken_y_height_ratios(config: PlotConfig) -> tuple[float, float]:
     upper_range = max(float(config.y_break_upper_max - config.y_break_upper_min), 1e-9)
     lower_range = max(float(config.y_break_lower_max - config.y_break_lower_min), 1e-9)
     upper_fraction = upper_range / (upper_range + lower_range)
     upper_fraction = min(0.6, max(0.32, upper_fraction))
     return upper_fraction, 1.0 - upper_fraction
+
+
+def _broken_x_width_ratios(config: PlotConfig) -> tuple[float, float]:
+    left_range = max(float(config.x_break_left_max - config.x_break_left_min), 1e-9)
+    right_range = max(float(config.x_break_right_max - config.x_break_right_min), 1e-9)
+    left_fraction = left_range / (left_range + right_range)
+    left_fraction = min(0.68, max(0.32, left_fraction))
+    return left_fraction, 1.0 - left_fraction
 
 
 def render_figure(df: pd.DataFrame, config: PlotConfig, series_configs: list[SeriesConfig]) -> RenderResult:
@@ -168,14 +226,24 @@ def render_figure(df: pd.DataFrame, config: PlotConfig, series_configs: list[Ser
     )
     right_axis_needed = any(series.y_axis == "right" for series in series_configs)
     broken_y = _use_broken_y_axis(config, right_axis_needed, warnings)
+    broken_x = _use_broken_x_axis(config, right_axis_needed, broken_y, warnings)
     if broken_y:
         gridspec = fig.add_gridspec(2, 1, height_ratios=_broken_y_height_ratios(config), hspace=max(config.y_break_gap, 0.01))
         ax_upper = fig.add_subplot(gridspec[0])
         ax = fig.add_subplot(gridspec[1], sharex=ax_upper)
+        ax_left = None
         plot_axes = [ax_upper, ax]
+        ax_right = None
+    elif broken_x:
+        gridspec = fig.add_gridspec(1, 2, width_ratios=_broken_x_width_ratios(config), wspace=max(config.x_break_gap, 0.01))
+        ax_left = fig.add_subplot(gridspec[0])
+        ax = fig.add_subplot(gridspec[1], sharey=ax_left)
+        ax_upper = None
+        plot_axes = [ax_left, ax]
         ax_right = None
     else:
         ax_upper = None
+        ax_left = None
         ax = fig.add_subplot(111)
         plot_axes = [ax]
         ax_right = ax.twinx() if right_axis_needed else None
@@ -187,13 +255,20 @@ def render_figure(df: pd.DataFrame, config: PlotConfig, series_configs: list[Ser
         return RenderResult(fig, warnings, [])
 
     plotted = 0
+    x_divisor = _scale_divisor(config.x_scale_divisor, "X", warnings)
+    y_divisor = _scale_divisor(config.y_scale_divisor, "Y", warnings)
+    y2_divisor = _scale_divisor(config.y2_scale_divisor, "Y2", warnings)
     for idx, series in enumerate(series_configs):
         if series.x not in df.columns or series.y not in df.columns:
             warnings.append(f"Missing column for series {series.label or series.y}.")
             continue
 
-        x = coerce_numeric(df[series.x])
-        y = coerce_numeric(df[series.y])
+        target_ax = ax_right if series.y_axis == "right" and ax_right is not None else ax
+        target_y_scale = config.y2_scale if target_ax is ax_right else config.y_scale
+        target_y_divisor = y2_divisor if target_ax is ax_right else y_divisor
+
+        x = coerce_numeric(df[series.x]) / x_divisor
+        y = coerce_numeric(df[series.y]) / target_y_divisor
         valid = x.notna() & y.notna()
 
         if config.x_scale == "log":
@@ -201,8 +276,6 @@ def render_figure(df: pd.DataFrame, config: PlotConfig, series_configs: list[Ser
             if invalid.any():
                 warnings.append(f"{series.x}: {int(invalid.sum())} non-positive x values skipped for log scale.")
             valid &= x > 0
-        target_ax = ax_right if series.y_axis == "right" and ax_right is not None else ax
-        target_y_scale = config.y2_scale if target_ax is ax_right else config.y_scale
 
         if target_y_scale == "log":
             invalid = valid & (y <= 0)
@@ -224,6 +297,9 @@ def render_figure(df: pd.DataFrame, config: PlotConfig, series_configs: list[Ser
         if broken_y and series.y_axis != "right":
             _plot_broken_y_series(ax_upper, x_values, y_values, series, color, label, plot_type, config.y_break_upper_min, config.y_break_upper_max)
             _plot_broken_y_series(ax, x_values, y_values, series, color, "_nolegend_", plot_type, config.y_break_lower_min, config.y_break_lower_max)
+        elif broken_x:
+            _plot_broken_x_series(ax_left, x_values, y_values, series, color, label, plot_type, config.x_break_left_min, config.x_break_left_max)
+            _plot_broken_x_series(ax, x_values, y_values, series, color, "_nolegend_", plot_type, config.x_break_right_min, config.x_break_right_max)
         else:
             _plot_series(target_ax, x_values, y_values, series, color, label, plot_type)
         plotted += 1
@@ -234,9 +310,11 @@ def render_figure(df: pd.DataFrame, config: PlotConfig, series_configs: list[Ser
         _apply_figure_layout(fig, config, warnings)
         return RenderResult(fig, warnings, [])
 
-    title_axis = ax_upper if broken_y and ax_upper is not None else ax
-    title_axis.set_title(_format_plot_text(config.title), fontsize=config.title_size)
-    ax.set_xlabel(_format_plot_text(config.x_label), fontsize=config.axis_size)
+    title_axis = ax_upper if broken_y and ax_upper is not None else ax_left if broken_x and ax_left is not None else ax
+    title_axis.set_title("" if broken_x else _format_plot_text(config.title), fontsize=config.title_size)
+    ax.set_xlabel("" if broken_x else _format_plot_text(config.x_label), fontsize=config.axis_size)
+    if broken_x and ax_left is not None:
+        ax_left.set_xlabel("")
     ax.set_ylabel("")
     for plot_axis in plot_axes:
         plot_axis.set_xscale(config.x_scale)
@@ -260,6 +338,18 @@ def render_figure(df: pd.DataFrame, config: PlotConfig, series_configs: list[Ser
         ax.tick_params(axis="x", which="both", top=False, labelbottom=config.show_x_tick_labels)
         ax_upper.spines["bottom"].set_visible(False)
         ax.spines["top"].set_visible(False)
+    if broken_x and ax_left is not None:
+        ax_left.tick_params(axis="y", which="both", right=False, labelleft=config.show_y_tick_labels)
+        ax.tick_params(axis="y", which="both", left=False, labelleft=False, right=True)
+        ax_left.tick_params(axis="x", labelbottom=config.show_x_tick_labels)
+        ax.tick_params(axis="x", labelbottom=config.show_x_tick_labels)
+        ax_left.spines["right"].set_visible(False)
+        ax.spines["left"].set_visible(False)
+
+    for plot_axis in plot_axes:
+        plot_axis.tick_params(axis="y", colors=config.y_axis_color)
+        plot_axis.spines["left"].set_edgecolor(config.y_axis_color)
+
     if ax_right is not None:
         ax.tick_params(axis="y", which="both", right=False, labelright=False)
         ax.spines["right"].set_visible(False)
@@ -283,6 +373,10 @@ def render_figure(df: pd.DataFrame, config: PlotConfig, series_configs: list[Ser
         if config.x_min is not None or config.x_max is not None:
             _apply_x_limits(ax, config)
             _apply_x_limits(ax_upper, config)
+    elif broken_x and ax_left is not None:
+        ax_left.set_xlim(config.x_break_left_min, config.x_break_left_max)
+        ax.set_xlim(config.x_break_right_min, config.x_break_right_max)
+        _apply_y_limits(ax, config, warnings, "left")
     else:
         _apply_limits(ax, config, warnings, "left")
     if ax_right is not None:
@@ -293,6 +387,11 @@ def render_figure(df: pd.DataFrame, config: PlotConfig, series_configs: list[Ser
         _prune_broken_y_boundary_ticks(ax_upper, ax)
         ax_upper.tick_params(axis="x", which="both", bottom=False, labelbottom=False, top=True)
         ax.tick_params(axis="x", which="both", top=False, labelbottom=config.show_x_tick_labels)
+    if broken_x and ax_left is not None:
+        _apply_tick_intervals(ax_left, config, warnings, "left")
+        _prune_broken_x_boundary_ticks(ax_left, ax)
+        ax_left.tick_params(axis="y", which="both", right=False, labelleft=config.show_y_tick_labels)
+        ax.tick_params(axis="y", which="both", left=False, labelleft=False, right=True)
     if ax_right is not None:
         _apply_tick_intervals(ax_right, config, warnings, "right")
     for axis in plot_axes + ([ax_right] if ax_right is not None else []):
@@ -305,15 +404,16 @@ def render_figure(df: pd.DataFrame, config: PlotConfig, series_configs: list[Ser
 
     legend_artist = None
     if config.legend and plotted > 0:
-        handles, labels = (ax_upper if broken_y and ax_upper is not None else ax).get_legend_handles_labels()
+        legend_axis = ax_upper if broken_y and ax_upper is not None else ax_left if broken_x and ax_left is not None else ax
+        handles, labels = legend_axis.get_legend_handles_labels()
         if ax_right is not None:
             right_handles, right_labels = ax_right.get_legend_handles_labels()
             handles += right_handles
             labels += right_labels
         legend_kwargs = {"frameon": False, "fontsize": config.legend_size}
         if config.legend_anchor_x is not None and config.legend_anchor_y is not None:
-            legend_kwargs.update({"loc": "upper left", "bbox_to_anchor": (config.legend_anchor_x, config.legend_anchor_y), "bbox_transform": ax.transAxes})
-        legend_artist = ax.legend(handles, labels, **legend_kwargs)
+            legend_kwargs.update({"loc": "upper left", "bbox_to_anchor": (config.legend_anchor_x, config.legend_anchor_y), "bbox_transform": legend_axis.transAxes})
+        legend_artist = legend_axis.legend(handles, labels, **legend_kwargs)
         legend_artist.set_picker(True)
         legend_artist.set_in_layout(False)
 
@@ -322,10 +422,18 @@ def render_figure(df: pd.DataFrame, config: PlotConfig, series_configs: list[Ser
         fig.subplots_adjust(hspace=max(config.y_break_gap, 0.01))
         _draw_fixed_y_label(fig, ax, config, warnings, ax_upper)
         _draw_y_break_marks(ax_upper, ax)
+    elif broken_x:
+        _apply_figure_layout(fig, config, warnings)
+        fig.subplots_adjust(wspace=max(config.x_break_gap, 0.01))
+        _draw_fixed_title(fig, ax_left, ax, config, warnings)
+        _draw_fixed_y_label(fig, ax_left, config, warnings)
+        _draw_fixed_x_label(fig, ax_left, ax, config, warnings)
+        _draw_x_break_marks(ax_left, ax)
     else:
         _apply_figure_layout(fig, config, warnings)
         _draw_fixed_y_label(fig, ax, config, warnings)
-    annotation_artists = _draw_annotations(ax, config.annotations or [])
+    annotation_axis = ax_left if broken_x and ax_left is not None else ax
+    annotation_artists = _draw_annotations(annotation_axis, config.annotations or [])
     return RenderResult(fig, warnings, annotation_artists, legend_artist)
 
 
@@ -340,10 +448,27 @@ def export_figure(fig: Figure, path: str | Path, config: PlotConfig) -> None:
     fig.savefig(path, **save_kwargs)
 
 
+def _scale_divisor(value: float, label: str, warnings: list[str]) -> float:
+    try:
+        divisor = float(value)
+    except (TypeError, ValueError):
+        warnings.append(f"{label} divisor is invalid; using 1.")
+        return 1.0
+    if divisor <= 0:
+        warnings.append(f"{label} divisor must be positive; using 1.")
+        return 1.0
+    return divisor
+
+
 def _apply_style(warnings: list[str]) -> None:
     rc_params = {
         "font.size": 8,
         "font.family": ["Arial", "Segoe UI Symbol", "DejaVu Sans"],
+        "mathtext.fontset": "custom",
+        "mathtext.rm": "Arial",
+        "mathtext.it": "Arial:italic",
+        "mathtext.bf": "Arial:bold",
+        "mathtext.default": "regular",
         "pdf.fonttype": 42,
         "svg.fonttype": "none",
         "axes.linewidth": 0.5,
@@ -415,6 +540,57 @@ def _draw_fixed_y_label(fig: Figure, ax, config: PlotConfig, warnings: list[str]
         rotation=90,
         ha="center",
         va="center",
+        fontsize=config.axis_size,
+        color=config.y_axis_color,
+    )
+    label.set_clip_on(False)
+    label.set_in_layout(False)
+
+
+def _draw_fixed_title(fig: Figure, ax_left, ax_right, config: PlotConfig, warnings: list[str]) -> None:
+    if not config.title:
+        return
+    _, total_height = _figure_size_mm(config)
+    total_height = max(total_height, 1e-9)
+    left_pos = ax_left.get_position()
+    right_pos = ax_right.get_position()
+    title_height_mm = config.title_size * 25.4 / 72.0
+    requested_y = max(left_pos.y1, right_pos.y1) + title_height_mm * 0.4 / total_height
+    max_visible_y = 1.0 - title_height_mm * 0.25 / total_height
+    y = min(requested_y, max_visible_y)
+    if y != requested_y:
+        warnings.append("Title needs more top canvas space; increase Plot top margin.")
+    title = fig.text(
+        (left_pos.x0 + right_pos.x1) * 0.5,
+        y,
+        _format_plot_text(config.title),
+        ha="center",
+        va="bottom",
+        fontsize=config.title_size,
+    )
+    title.set_clip_on(False)
+    title.set_in_layout(False)
+
+
+def _draw_fixed_x_label(fig: Figure, ax_left, ax_right, config: PlotConfig, warnings: list[str]) -> None:
+    if not config.x_label:
+        return
+    _, total_height = _figure_size_mm(config)
+    total_height = max(total_height, 1e-9)
+    left_pos = ax_left.get_position()
+    right_pos = ax_right.get_position()
+    label_height_mm = config.axis_size * 25.4 / 72.0
+    requested_y = min(left_pos.y0, right_pos.y0) - label_height_mm * 1.4 / total_height
+    min_visible_y = label_height_mm * 0.25 / total_height
+    y = max(requested_y, min_visible_y)
+    if y != requested_y:
+        warnings.append("X label needs more bottom canvas space; increase Plot bottom margin.")
+    label = fig.text(
+        (left_pos.x0 + right_pos.x1) * 0.5,
+        y,
+        _format_plot_text(config.x_label),
+        ha="center",
+        va="top",
         fontsize=config.axis_size,
     )
     label.set_clip_on(False)
@@ -586,6 +762,8 @@ def _format_plot_text(text: str) -> str:
     formatted = re.sub(r"\\?(?:bar|overbar)\{([^{}]+)\}", overbar_braced, text)
     formatted = re.sub(r"_\{([^{}]+)\}", braced, formatted)
     formatted = re.sub(r"\^\{([^{}]+)\}", superscript_braced, formatted)
+    formatted = re.sub(r"_\(([^()]+)\)", braced, formatted)
+    formatted = re.sub(r"\^\(([^()]+)\)", superscript_braced, formatted)
     formatted = re.sub(r"_([0-9]+(?:\.[0-9]+)?|[A-Za-z])", lambda match: _subscript_math(match.group(1)), formatted)
     return re.sub(r"\^([+-]?[0-9]+(?:\.[0-9]+)?|[A-Za-z])", lambda match: _superscript_math(match.group(1)), formatted)
 
@@ -633,6 +811,20 @@ def _draw_y_break_marks(ax_upper, ax_lower) -> None:
         ax_lower.plot((x - size, x + size), (1 - size, 1 + size), transform=ax_lower.transAxes, **kwargs)
 
 
+def _draw_x_break_marks(ax_left, ax_right) -> None:
+    size = 0.012
+    kwargs = {
+        "color": "black",
+        "clip_on": False,
+        "linewidth": 0.65,
+        "solid_capstyle": "round",
+        "zorder": 20,
+    }
+    for y in (0.0, 1.0):
+        ax_left.plot((1 - size, 1 + size), (y - size, y + size), transform=ax_left.transAxes, **kwargs)
+        ax_right.plot((-size, size), (y - size, y + size), transform=ax_right.transAxes, **kwargs)
+
+
 def _prune_broken_y_boundary_ticks(ax_upper, ax_lower) -> None:
     upper_bottom, upper_top = ax_upper.get_ylim()
     lower_bottom, lower_top = ax_lower.get_ylim()
@@ -646,6 +838,21 @@ def _prune_broken_y_boundary_ticks(ax_upper, ax_lower) -> None:
     )
     ax_upper.set_ylim(upper_bottom, upper_top)
     ax_lower.set_ylim(lower_bottom, lower_top)
+
+
+def _prune_broken_x_boundary_ticks(ax_left, ax_right) -> None:
+    left_low, left_high = ax_left.get_xlim()
+    right_low, right_high = ax_right.get_xlim()
+    left_tol = max(abs(left_high - left_low), 1.0) * 1e-9
+    right_tol = max(abs(right_high - right_low), 1.0) * 1e-9
+    ax_left.set_xticks(
+        [tick for tick in ax_left.get_xticks() if left_low <= tick < left_high and abs(tick - left_high) > left_tol]
+    )
+    ax_right.set_xticks(
+        [tick for tick in ax_right.get_xticks() if right_low < tick <= right_high and abs(tick - right_low) > right_tol]
+    )
+    ax_left.set_xlim(left_low, left_high)
+    ax_right.set_xlim(right_low, right_high)
 
 
 def _annotation_display_geometry(ax, annotation: AnnotationConfig) -> tuple[float, float, float, float]:
@@ -674,7 +881,10 @@ def _arrow_head_start(start: tuple[float, float], end: tuple[float, float]) -> t
 
 def _apply_limits(ax, config: PlotConfig, warnings: list[str], side: str) -> None:
     _apply_x_limits(ax, config)
+    _apply_y_limits(ax, config, warnings, side)
 
+
+def _apply_y_limits(ax, config: PlotConfig, warnings: list[str], side: str) -> None:
     y_min = config.y2_min if side == "right" else config.y_min
     y_max = config.y2_max if side == "right" else config.y_max
     y_scale = config.y2_scale if side == "right" else config.y_scale
@@ -713,27 +923,56 @@ def _resolve_y_limit(value: float, scale: str, warnings: list[str], side: str, b
 
 
 def _apply_tick_intervals(ax, config: PlotConfig, warnings: list[str], side: str) -> None:
-    if config.x_tick_interval is not None:
-        if config.x_scale == "log":
-            warnings.append("X tick interval is ignored on log scale.")
-        elif config.x_tick_interval > 0:
-            ax.xaxis.set_major_locator(MultipleLocator(config.x_tick_interval))
-        else:
-            warnings.append("X tick interval must be positive.")
+    _apply_major_locator(ax.xaxis, config.x_scale, config.x_tick_interval, warnings, "X")
     _apply_minor_locator(ax.xaxis, config.x_scale, config.x_minor_divisions)
 
     y_interval = config.y2_tick_interval if side == "right" else config.y_tick_interval
     y_scale = config.y2_scale if side == "right" else config.y_scale
     y_minor_divisions = config.y2_minor_divisions if side == "right" else config.y_minor_divisions
     label = "Y2" if side == "right" else "Y"
-    if y_interval is not None:
-        if y_scale == "log":
-            warnings.append(f"{label} tick interval is ignored on log scale.")
-        elif y_interval > 0:
-            ax.yaxis.set_major_locator(MultipleLocator(y_interval))
-        else:
-            warnings.append(f"{label} tick interval must be positive.")
+    _apply_major_locator(ax.yaxis, y_scale, y_interval, warnings, label)
     _apply_minor_locator(ax.yaxis, y_scale, y_minor_divisions)
+
+
+def _apply_major_locator(axis_obj, scale: str, interval: float | None, warnings: list[str], label: str) -> None:
+    if interval is None:
+        return
+    if interval <= 0:
+        warnings.append(f"{label} tick interval must be positive.")
+        return
+    if scale == "log":
+        ticks = _log_major_ticks(axis_obj.get_view_interval(), interval, warnings, label)
+        if ticks:
+            axis_obj.set_major_locator(FixedLocator(ticks))
+            axis_obj.set_major_formatter(LogFormatterSciNotation(base=10.0, labelOnlyBase=False))
+        return
+    axis_obj.set_major_locator(MultipleLocator(interval))
+
+
+def _log_major_ticks(view_interval, decade_interval: float, warnings: list[str], label: str) -> list[float]:
+    low, high = sorted(float(value) for value in view_interval)
+    if low <= 0 or high <= 0:
+        warnings.append(f"{label} tick interval needs positive limits on log scale.")
+        return []
+
+    log_low = math.log10(low)
+    log_high = math.log10(high)
+    eps = 1e-10
+    start = math.ceil((log_low - eps) / decade_interval) * decade_interval
+    stop = math.floor((log_high + eps) / decade_interval) * decade_interval
+    if start > stop:
+        warnings.append(f"{label} tick interval is wider than the visible log range.")
+        return []
+
+    ticks: list[float] = []
+    exponent = start
+    max_ticks = 200
+    while exponent <= stop + eps and len(ticks) < max_ticks:
+        ticks.append(10 ** exponent)
+        exponent += decade_interval
+    if exponent <= stop + eps:
+        warnings.append(f"{label} tick interval creates too many log ticks; showing the first {max_ticks}.")
+    return ticks
 
 
 def _apply_minor_locator(axis_obj, scale: str, divisions: int) -> None:
@@ -747,6 +986,6 @@ def _apply_minor_locator(axis_obj, scale: str, divisions: int) -> None:
 
 
 def _log_minor_subs(divisions: int) -> tuple[float, ...]:
-    if divisions <= 1:
+    if divisions <= 0:
         return ()
-    return tuple(10 ** (idx / divisions) for idx in range(1, divisions))
+    return tuple(float(value) for value in range(2, 10))

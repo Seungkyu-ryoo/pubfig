@@ -7,6 +7,7 @@ from dataclasses import asdict, dataclass
 import json
 import math
 from pathlib import Path
+import re
 
 import matplotlib as mpl
 from matplotlib.colors import to_hex
@@ -119,6 +120,9 @@ class SpreadsheetTableWidget(QTableWidget):
     delete_requested = Signal()
 
     def keyPressEvent(self, event):
+        if event.modifiers() & Qt.ControlModifier and event.key() in (Qt.Key_Left, Qt.Key_Right, Qt.Key_Up, Qt.Key_Down):
+            self.move_to_data_edge(event.key())
+            return
         if event.matches(QKeySequence.Paste):
             text = QApplication.clipboard().text()
             if text:
@@ -127,6 +131,11 @@ class SpreadsheetTableWidget(QTableWidget):
         if event.matches(QKeySequence.Copy):
             QApplication.clipboard().setText(self.selected_text())
             self.copied.emit("Copied selected cells.")
+            return
+        if event.matches(QKeySequence.Cut):
+            QApplication.clipboard().setText(self.selected_text())
+            self.delete_requested.emit()
+            self.copied.emit("Cut selected cells.")
             return
         if event.key() in (Qt.Key_Delete, Qt.Key_Backspace):
             self.delete_requested.emit()
@@ -146,6 +155,61 @@ class SpreadsheetTableWidget(QTableWidget):
                 cells.append("" if item is None else item.text())
             rows.append("\t".join(cells))
         return "\n".join(rows)
+
+    def move_to_data_edge(self, key: int) -> None:
+        if self.rowCount() <= 0 or self.columnCount() <= 0:
+            return
+        row = max(0, self.currentRow())
+        col = max(0, self.currentColumn())
+        if row < 0 or col < 0:
+            return
+
+        directions = {
+            Qt.Key_Left: (0, -1),
+            Qt.Key_Right: (0, 1),
+            Qt.Key_Up: (-1, 0),
+            Qt.Key_Down: (1, 0),
+        }
+        dr, dc = directions[key]
+        target_row, target_col = self._data_edge_cell(row, col, dr, dc)
+        self.setCurrentCell(target_row, target_col)
+        item = self.item(target_row, target_col)
+        if item is not None:
+            self.scrollToItem(item)
+
+    def _data_edge_cell(self, row: int, col: int, dr: int, dc: int) -> tuple[int, int]:
+        last_row = self.rowCount() - 1
+        last_col = self.columnCount() - 1
+
+        def in_bounds(r: int, c: int) -> bool:
+            return 0 <= r <= last_row and 0 <= c <= last_col
+
+        def filled(r: int, c: int) -> bool:
+            item = self.item(r, c)
+            return item is not None and bool(item.text().strip())
+
+        next_row = row + dr
+        next_col = col + dc
+        if not in_bounds(next_row, next_col):
+            return row, col
+
+        current_filled = filled(row, col)
+        next_filled = filled(next_row, next_col)
+
+        if current_filled and next_filled:
+            while in_bounds(next_row + dr, next_col + dc) and filled(next_row + dr, next_col + dc):
+                next_row += dr
+                next_col += dc
+            return next_row, next_col
+
+        while in_bounds(next_row, next_col) and not filled(next_row, next_col):
+            edge_row = next_row
+            edge_col = next_col
+            next_row += dr
+            next_col += dc
+        if in_bounds(next_row, next_col):
+            return next_row, next_col
+        return edge_row, edge_col
 
 
 class NoWheelComboBox(QComboBox):
@@ -341,7 +405,7 @@ class GraphDrawerWindow(QMainWindow):
         project_box = QGroupBox("Project Explorer")
         project_layout = QVBoxLayout(project_box)
         self.figure_list = QListWidget()
-        self.figure_list.setMaximumHeight(100)
+        self.figure_list.setMinimumHeight(80)
         project_layout.addWidget(self.figure_list)
         project_buttons = QHBoxLayout()
         self.new_figure_btn = QPushButton("New")
@@ -353,7 +417,12 @@ class GraphDrawerWindow(QMainWindow):
         project_buttons.addWidget(self.rename_figure_btn)
         project_buttons.addWidget(self.delete_figure_btn)
         project_layout.addLayout(project_buttons)
-        layout.addWidget(project_box)
+        project_move_buttons = QHBoxLayout()
+        self.move_figure_up_btn = QPushButton("Up")
+        self.move_figure_down_btn = QPushButton("Down")
+        project_move_buttons.addWidget(self.move_figure_up_btn)
+        project_move_buttons.addWidget(self.move_figure_down_btn)
+        project_layout.addLayout(project_move_buttons)
 
         self.table = SpreadsheetTableWidget()
         self.table.pasted.connect(self.handle_table_paste)
@@ -370,8 +439,19 @@ class GraphDrawerWindow(QMainWindow):
         self.table.setContextMenuPolicy(Qt.CustomContextMenu)
         self.table.customContextMenuRequested.connect(self.show_table_menu)
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+        self.table.horizontalHeader().setMinimumSectionSize(20)
         self.table.verticalHeader().setVisible(True)
-        layout.addWidget(self.table, 1)
+        self.table.verticalHeader().setSectionResizeMode(QHeaderView.Interactive)
+        self.table.verticalHeader().setMinimumSectionSize(18)
+
+        self.data_splitter = QSplitter(Qt.Vertical)
+        self.data_splitter.addWidget(project_box)
+        self.data_splitter.addWidget(self.table)
+        self.data_splitter.setChildrenCollapsible(False)
+        self.data_splitter.setStretchFactor(0, 0)
+        self.data_splitter.setStretchFactor(1, 1)
+        self.data_splitter.setSizes([260, 520])
+        layout.addWidget(self.data_splitter, 1)
 
         self.data_info = QLabel("No data")
         layout.addWidget(self.data_info)
@@ -634,6 +714,8 @@ class GraphDrawerWindow(QMainWindow):
         self.tick_size_spin = self._int_spin(self.plot_config.tick_size, 4, 40)
         self.legend_size_spin = self._int_spin(self.plot_config.legend_size, 4, 40)
         self.y_label_offset_spin = self._double_spin(self.plot_config.y_label_offset_mm, 0.0, 50.0, 1)
+        self.y_axis_color_btn = QPushButton(self.plot_config.y_axis_color)
+        self.y_axis_color_btn.setStyleSheet("background-color: #000000; color: white;")
         self.y2_axis_color_btn = QPushButton(self.plot_config.y2_axis_color)
         self.y2_axis_color_btn.setStyleSheet("background-color: #000000; color: white;")
         self.pad_left_spin = self._double_spin(self.plot_config.pad_left_mm, 0.0, 100.0, 1)
@@ -655,6 +737,9 @@ class GraphDrawerWindow(QMainWindow):
         self.y_scale_combo.addItems(["linear", "log"])
         self.y2_scale_combo = NoWheelComboBox()
         self.y2_scale_combo.addItems(["linear", "log"])
+        self.x_scale_divisor_edit = QLineEdit(str(self.plot_config.x_scale_divisor))
+        self.y_scale_divisor_edit = QLineEdit(str(self.plot_config.y_scale_divisor))
+        self.y2_scale_divisor_edit = QLineEdit(str(self.plot_config.y2_scale_divisor))
         self.x_min_edit = QLineEdit()
         self.x_max_edit = QLineEdit()
         self.y_min_edit = QLineEdit()
@@ -667,6 +752,13 @@ class GraphDrawerWindow(QMainWindow):
         self.x_minor_divisions_spin = self._int_spin(self.plot_config.x_minor_divisions, 0, 20)
         self.y_minor_divisions_spin = self._int_spin(self.plot_config.y_minor_divisions, 0, 20)
         self.y2_minor_divisions_spin = self._int_spin(self.plot_config.y2_minor_divisions, 0, 20)
+        self.x_break_check = QCheckBox("X broken axis")
+        self.x_break_check.setChecked(self.plot_config.x_break_enabled)
+        self.x_break_left_min_edit = QLineEdit()
+        self.x_break_left_max_edit = QLineEdit()
+        self.x_break_right_min_edit = QLineEdit()
+        self.x_break_right_max_edit = QLineEdit()
+        self.x_break_gap_spin = self._double_spin(self.plot_config.x_break_gap, 0.01, 0.5, 3)
         self.y_break_check = QCheckBox("Y broken axis")
         self.y_break_check.setChecked(self.plot_config.y_break_enabled)
         self.y_break_lower_min_edit = QLineEdit()
@@ -682,6 +774,10 @@ class GraphDrawerWindow(QMainWindow):
             self.x_tick_interval_edit,
             self.y_tick_interval_edit,
             self.y2_tick_interval_edit,
+            self.x_break_left_min_edit,
+            self.x_break_left_max_edit,
+            self.x_break_right_min_edit,
+            self.x_break_right_max_edit,
             self.y_break_lower_min_edit,
             self.y_break_lower_max_edit,
             self.y_break_upper_min_edit,
@@ -692,6 +788,14 @@ class GraphDrawerWindow(QMainWindow):
         self.y_max_edit.setPlaceholderText("auto; log: exponent")
         self.y2_min_edit.setPlaceholderText("auto; log: exponent")
         self.y2_max_edit.setPlaceholderText("auto; log: exponent")
+        for edit in (self.x_tick_interval_edit, self.y_tick_interval_edit, self.y2_tick_interval_edit):
+            edit.setPlaceholderText("auto; log: decades")
+            edit.setToolTip("Linear scale: data-unit interval. Log scale: decade interval, e.g. 1 for 10^n ticks or 0.5 for half-decades.")
+        for spin in (self.x_minor_divisions_spin, self.y_minor_divisions_spin, self.y2_minor_divisions_spin):
+            spin.setToolTip("Linear scale: minor subdivisions. Log scale: 0 hides minor ticks; any positive value shows standard 2-9 minor ticks per decade.")
+        for edit in (self.x_scale_divisor_edit, self.y_scale_divisor_edit, self.y2_scale_divisor_edit):
+            edit.setPlaceholderText("1")
+            edit.setToolTip("Plot values are divided by this positive number. Example: 1e-6 converts seconds to microseconds.")
         self.y_offset_spin = self._double_spin(self.plot_config.y_offset_step, -1e9, 1e9, 4)
         self.show_x_tick_labels_check = QCheckBox("Show X tick labels")
         self.show_x_tick_labels_check.setChecked(True)
@@ -700,7 +804,7 @@ class GraphDrawerWindow(QMainWindow):
         self.show_y2_tick_labels_check = QCheckBox("Show Y2 tick labels")
         self.show_y2_tick_labels_check.setChecked(True)
         self.grid_check = QCheckBox("Grid")
-        self.grid_check.setChecked(True)
+        self.grid_check.setChecked(self.plot_config.grid)
         self.legend_check = QCheckBox("Legend")
         self.legend_check.setChecked(True)
 
@@ -753,6 +857,9 @@ class GraphDrawerWindow(QMainWindow):
         axes_form.addRow("X scale", self.x_scale_combo)
         axes_form.addRow("Y scale", self.y_scale_combo)
         axes_form.addRow("Y2 scale", self.y2_scale_combo)
+        axes_form.addRow("X divisor", self.x_scale_divisor_edit)
+        axes_form.addRow("Y divisor", self.y_scale_divisor_edit)
+        axes_form.addRow("Y2 divisor", self.y2_scale_divisor_edit)
         axes_form.addRow("X min", self.x_min_edit)
         axes_form.addRow("X max", self.x_max_edit)
         axes_form.addRow("Y min", self.y_min_edit)
@@ -765,12 +872,18 @@ class GraphDrawerWindow(QMainWindow):
         axes_form.addRow("Y minor divisions", self.y_minor_divisions_spin)
         axes_form.addRow("Y2 tick interval", self.y2_tick_interval_edit)
         axes_form.addRow("Y2 minor divisions", self.y2_minor_divisions_spin)
+        axes_form.addRow(self.x_break_check)
+        axes_form.addRow("X break left min", self.x_break_left_min_edit)
+        axes_form.addRow("X break left max", self.x_break_left_max_edit)
+        axes_form.addRow("X break right min", self.x_break_right_min_edit)
+        axes_form.addRow("X break right max", self.x_break_right_max_edit)
+        axes_form.addRow("X break gap", self.x_break_gap_spin)
         axes_form.addRow(self.y_break_check)
-        axes_form.addRow("Break lower min", self.y_break_lower_min_edit)
-        axes_form.addRow("Break lower max", self.y_break_lower_max_edit)
-        axes_form.addRow("Break upper min", self.y_break_upper_min_edit)
-        axes_form.addRow("Break upper max", self.y_break_upper_max_edit)
-        axes_form.addRow("Break gap", self.y_break_gap_spin)
+        axes_form.addRow("Y break lower min", self.y_break_lower_min_edit)
+        axes_form.addRow("Y break lower max", self.y_break_lower_max_edit)
+        axes_form.addRow("Y break upper min", self.y_break_upper_min_edit)
+        axes_form.addRow("Y break upper max", self.y_break_upper_max_edit)
+        axes_form.addRow("Y break gap", self.y_break_gap_spin)
         axes_form.addRow(self.show_x_tick_labels_check)
         axes_form.addRow(self.show_y_tick_labels_check)
         axes_form.addRow(self.show_y2_tick_labels_check)
@@ -782,6 +895,7 @@ class GraphDrawerWindow(QMainWindow):
         style_form.addRow("Axis size", self.axis_size_spin)
         style_form.addRow("Tick size", self.tick_size_spin)
         style_form.addRow("Legend size", self.legend_size_spin)
+        style_form.addRow("Y1 axis color", self.y_axis_color_btn)
         style_form.addRow("Y2 axis color", self.y2_axis_color_btn)
         style_form.addRow("Y offset", self.y_offset_spin)
         style_form.addRow(self.grid_check)
@@ -895,12 +1009,16 @@ class GraphDrawerWindow(QMainWindow):
         self.trim_check = QCheckBox("Trim whitespace")
         self.transparent_check = QCheckBox("Transparent background")
         self.export_btn = QPushButton("Export figure")
+        self.export_all_btn = QPushButton("Export all figures")
+        self.new_project_btn = QPushButton("New project")
         self.save_project_btn = QPushButton("Save project")
         self.load_project_btn = QPushButton("Load project")
 
         layout.addWidget(self.trim_check)
         layout.addWidget(self.transparent_check)
         layout.addWidget(self.export_btn)
+        layout.addWidget(self.export_all_btn)
+        layout.addWidget(self.new_project_btn)
         layout.addWidget(self.save_project_btn)
         layout.addWidget(self.load_project_btn)
         return box
@@ -911,6 +1029,8 @@ class GraphDrawerWindow(QMainWindow):
         self.duplicate_figure_btn.clicked.connect(self.duplicate_project_figure)
         self.rename_figure_btn.clicked.connect(self.rename_project_figure)
         self.delete_figure_btn.clicked.connect(self.delete_project_figure)
+        self.move_figure_up_btn.clicked.connect(lambda: self.move_project_figure(-1))
+        self.move_figure_down_btn.clicked.connect(lambda: self.move_project_figure(1))
         self.fit_preview_check.toggled.connect(self.update_canvas_size)
         self.preview_zoom_spin.valueChanged.connect(self.update_canvas_size)
         self.center_preview_btn.clicked.connect(self.center_preview)
@@ -933,6 +1053,7 @@ class GraphDrawerWindow(QMainWindow):
         self.cmap_alpha_only_check.toggled.connect(self.update_cmap_mode)
         self.cmap_base_color_btn.clicked.connect(self.choose_cmap_base_color)
         self.annotation_color_btn.clicked.connect(self.choose_annotation_color)
+        self.y_axis_color_btn.clicked.connect(self.choose_y_axis_color)
         self.y2_axis_color_btn.clicked.connect(self.choose_y2_axis_color)
         self.add_annotation_btn.clicked.connect(self.add_annotation)
         self.remove_annotation_btn.clicked.connect(self.remove_selected_annotation)
@@ -956,6 +1077,8 @@ class GraphDrawerWindow(QMainWindow):
         ):
             self._connect_change(widget, self.update_selected_annotation)
         self.export_btn.clicked.connect(self.export_current_figure)
+        self.export_all_btn.clicked.connect(self.export_all_figures)
+        self.new_project_btn.clicked.connect(self.new_project)
         self.save_project_btn.clicked.connect(self.save_project)
         self.load_project_btn.clicked.connect(self.load_project)
         self.copy_style_btn.clicked.connect(self.copy_current_style)
@@ -991,6 +1114,7 @@ class GraphDrawerWindow(QMainWindow):
             self.tick_size_spin,
             self.legend_size_spin,
             self.y_label_offset_spin,
+            self.y_axis_color_btn,
             self.y2_axis_color_btn,
             self.pad_left_spin,
             self.pad_right_spin,
@@ -1004,6 +1128,9 @@ class GraphDrawerWindow(QMainWindow):
             self.x_scale_combo,
             self.y_scale_combo,
             self.y2_scale_combo,
+            self.x_scale_divisor_edit,
+            self.y_scale_divisor_edit,
+            self.y2_scale_divisor_edit,
             self.x_min_edit,
             self.x_max_edit,
             self.y_min_edit,
@@ -1016,6 +1143,12 @@ class GraphDrawerWindow(QMainWindow):
             self.y_minor_divisions_spin,
             self.y2_tick_interval_edit,
             self.y2_minor_divisions_spin,
+            self.x_break_check,
+            self.x_break_left_min_edit,
+            self.x_break_left_max_edit,
+            self.x_break_right_min_edit,
+            self.x_break_right_max_edit,
+            self.x_break_gap_spin,
             self.y_break_check,
             self.y_break_lower_min_edit,
             self.y_break_lower_max_edit,
@@ -1057,7 +1190,7 @@ class GraphDrawerWindow(QMainWindow):
             return
         self.push_current_undo_state()
         self._paste_grid(row, col, grid)
-        self.sync_dataframe_from_table()
+        self.sync_dataframe_after_paste(row, col, grid)
         self.update_undo_baseline()
         self.set_status(f"Pasted {len(grid)} rows x {max(len(values) for values in grid)} cols.")
 
@@ -1190,13 +1323,22 @@ class GraphDrawerWindow(QMainWindow):
         if self.project_figures:
             self.figure_list.setCurrentRow(max(0, min(self.active_figure_index, len(self.project_figures) - 1)))
         self.figure_list.blockSignals(False)
+        self.update_project_move_buttons()
+
+    def update_project_move_buttons(self) -> None:
+        row = self.figure_list.currentRow()
+        count = len(self.project_figures)
+        self.move_figure_up_btn.setEnabled(count > 1 and row > 0)
+        self.move_figure_down_btn.setEnabled(count > 1 and 0 <= row < count - 1)
 
     def switch_project_figure(self, row: int) -> None:
         if self.loading_project_figure or row < 0 or row >= len(self.project_figures) or row == self.active_figure_index:
+            self.update_project_move_buttons()
             return
         self.save_active_figure_state()
         self.active_figure_index = row
         self.load_project_figure(self.project_figures[row])
+        self.update_project_move_buttons()
         self.set_status(f"Switched to {self.project_figures[row].name}.")
 
     def new_project_figure(self) -> None:
@@ -1268,6 +1410,25 @@ class GraphDrawerWindow(QMainWindow):
         self.update_undo_baseline()
         self.set_status(f"Deleted {removed.name}.")
 
+    def move_project_figure(self, offset: int) -> None:
+        if len(self.project_figures) <= 1:
+            return
+        row = self.figure_list.currentRow()
+        if row < 0:
+            row = self.active_figure_index
+        target = row + offset
+        if row < 0 or row >= len(self.project_figures) or target < 0 or target >= len(self.project_figures):
+            self.update_project_move_buttons()
+            return
+
+        self.push_current_undo_state()
+        self.save_active_figure_state()
+        self.project_figures[row], self.project_figures[target] = self.project_figures[target], self.project_figures[row]
+        self.active_figure_index = target
+        self.refresh_figure_list()
+        self.update_undo_baseline()
+        self.set_status(f"Moved {self.project_figures[target].name} {'up' if offset < 0 else 'down'}.")
+
     def next_figure_name(self, base: str = "Figure") -> str:
         existing = {figure.name for figure in self.project_figures}
         root = base
@@ -1301,7 +1462,8 @@ class GraphDrawerWindow(QMainWindow):
             for col_idx, value in enumerate(row.tolist()):
                 item = QTableWidgetItem("" if pd.isna(value) else str(value))
                 self.table.setItem(row_idx, col_idx, item)
-        self.table.resizeColumnsToContents()
+        if len(self.df) * max(len(self.df.columns), 1) <= 2000:
+            self.table.resizeColumnsToContents()
         self._update_column_headers()
         self.data_info.setText(f"{max(len(self.df) - DATA_START_ROW, 0)} data rows, {len(self.df.columns)} columns")
         self.table.blockSignals(False)
@@ -1530,33 +1692,70 @@ class GraphDrawerWindow(QMainWindow):
     def _paste_grid(self, start_row: int, start_col: int, grid: list[list[str]]) -> None:
         row_count = start_row + len(grid)
         col_count = start_col + max(len(row) for row in grid)
+        self.table.setUpdatesEnabled(False)
         self.table.blockSignals(True)
-        self._ensure_table_size(row_count, col_count)
+        try:
+            self._ensure_table_size(row_count, col_count)
 
-        for row_offset, row_values in enumerate(grid):
-            for col_offset, value in enumerate(row_values):
-                row = start_row + row_offset
-                col = start_col + col_offset
-                item = self.table.item(row, col)
-                if item is None:
-                    item = QTableWidgetItem("")
-                    self.table.setItem(row, col, item)
-                item.setText(value)
-        self.table.blockSignals(False)
+            for row_offset, row_values in enumerate(grid):
+                for col_offset, value in enumerate(row_values):
+                    row = start_row + row_offset
+                    col = start_col + col_offset
+                    item = self.table.item(row, col)
+                    if item is None:
+                        if value == "":
+                            continue
+                        item = QTableWidgetItem("")
+                        self.table.setItem(row, col, item)
+                    item.setText(value)
+                    if row == ROLE_ROW:
+                        self._normalize_role_cell(item)
+        finally:
+            self.table.blockSignals(False)
+            self.table.setUpdatesEnabled(True)
 
     def _ensure_table_size(self, rows: int, columns: int) -> None:
-        while self.table.rowCount() < rows:
-            row = self.table.rowCount()
-            self.table.insertRow(row)
-            for col in range(self.table.columnCount()):
-                self.table.setItem(row, col, QTableWidgetItem(""))
+        if self.table.rowCount() < rows:
+            self.table.setRowCount(rows)
         while self.table.columnCount() < columns:
             col = self.table.columnCount()
-            self.table.insertColumn(col)
-            self.table.setHorizontalHeaderItem(col, QTableWidgetItem(self._next_column_name()))
-            for row in range(self.table.rowCount()):
-                self.table.setItem(row, col, QTableWidgetItem(""))
+            name = self._next_column_name()
+            self.table.setColumnCount(col + 1)
+            self.table.setHorizontalHeaderItem(col, QTableWidgetItem(name))
         self._ensure_metadata_rows()
+
+    def sync_dataframe_after_paste(self, start_row: int, start_col: int, grid: list[list[str]]) -> None:
+        columns = [self._header_text(col) for col in range(self.table.columnCount())]
+        if len(self.df) != self.table.rowCount() or list(map(str, self.df.columns)) != columns:
+            old_values = self.df.fillna("").astype(str).values.tolist()
+            rows = [[""] * len(columns) for _ in range(self.table.rowCount())]
+            for row_idx in range(min(len(old_values), len(rows))):
+                for col_idx in range(min(len(old_values[row_idx]), len(columns))):
+                    rows[row_idx][col_idx] = old_values[row_idx][col_idx]
+            self.df = pd.DataFrame(rows, columns=columns)
+
+        while len(self.df) < self.table.rowCount():
+            self.df.loc[len(self.df)] = [""] * len(self.df.columns)
+
+        for row_offset, row_values in enumerate(grid):
+            row = start_row + row_offset
+            if row >= len(self.df):
+                break
+            for col_offset, value in enumerate(row_values):
+                col = start_col + col_offset
+                if col >= len(self.df.columns):
+                    break
+                if row == ROLE_ROW:
+                    value = self._normalized_role_text(value)
+                self.df.iat[row, col] = value
+
+        self.table.setVerticalHeaderLabels(self._row_labels(self.table.rowCount()))
+        metadata_touched = start_row <= NAME_ROW < start_row + len(grid) or start_row <= ROLE_ROW < start_row + len(grid)
+        if metadata_touched:
+            self.populate_columns()
+            self._update_column_headers()
+        self.data_info.setText(f"{max(len(self.df) - DATA_START_ROW, 0)} data rows, {len(self.df.columns)} columns")
+        self.schedule_render()
 
     def _table_is_blank(self) -> bool:
         for row in range(self.table.rowCount()):
@@ -1630,13 +1829,17 @@ class GraphDrawerWindow(QMainWindow):
         return self.df.iloc[DATA_START_ROW:].reset_index(drop=True)
 
     def _normalize_role_cell(self, item: QTableWidgetItem) -> None:
-        text = item.text().strip().upper()
+        item.setText(self._normalized_role_text(item.text()))
+
+    def _normalized_role_text(self, value: str) -> str:
+        text = str(value).strip().upper()
         if text.startswith("X"):
-            item.setText("X")
-        elif text.startswith("Y"):
-            item.setText("Y")
-        elif text in ("", "NONE", "-"):
-            item.setText("")
+            return "X"
+        if text.startswith("Y"):
+            return "Y"
+        if text in ("", "NONE", "-"):
+            return ""
+        return str(value)
 
     def _update_column_headers(self) -> None:
         for col in range(self.table.columnCount()):
@@ -1799,6 +2002,7 @@ class GraphDrawerWindow(QMainWindow):
         self.push_current_undo_state()
         color_name = color.name()
         self.series_by_y[target].color = color_name
+        self.series_by_y[target].force_opaque = False
         self._set_color_button(color_name)
         self.schedule_render()
         self.update_undo_baseline()
@@ -1826,6 +2030,7 @@ class GraphDrawerWindow(QMainWindow):
                     self.series_by_y[y_column] = series
                 series.color = base_color
                 series.alpha = round(alpha_val, 4)
+                series.force_opaque = False
             if target in self.series_by_y:
                 self._load_series_into_widgets(self.series_by_y[target])
             self.set_status(f"Applied alpha ({dist}, {a_start:.2f}–{a_end:.2f}) to {count} series.")
@@ -1842,8 +2047,10 @@ class GraphDrawerWindow(QMainWindow):
                     series = default_series(x_column, y_column, idx)
                     self.series_by_y[y_column] = series
                 series.color = color
+                series.alpha = 1.0
+                series.force_opaque = True
             if target in self.series_by_y:
-                self._set_color_button(self.series_by_y[target].color)
+                self._load_series_into_widgets(self.series_by_y[target])
             self.set_status(f"Applied {self.cmap_combo.currentText()} colormap to {count} series.")
         self.schedule_render()
         self.update_undo_baseline()
@@ -1866,9 +2073,11 @@ class GraphDrawerWindow(QMainWindow):
                 series = default_series(x_column, y_column, idx)
                 self.series_by_y[y_column] = series
             series.color = colors[idx]
+            series.alpha = 1.0
+            series.force_opaque = True
         target = self.style_target_combo.currentText()
         if target in self.series_by_y:
-            self._set_color_button(self.series_by_y[target].color)
+            self._load_series_into_widgets(self.series_by_y[target])
         self.schedule_render()
         self.update_undo_baseline()
         self.set_status(f"Applied {palette_name} palette to {len(selected)} series.")
@@ -1972,6 +2181,16 @@ class GraphDrawerWindow(QMainWindow):
             return
         self.push_current_undo_state()
         self._set_y2_axis_color_button(color.name())
+        self.schedule_render()
+        self.update_undo_baseline()
+
+    def choose_y_axis_color(self) -> None:
+        current = self.y_axis_color_btn.text()
+        color = QColorDialog.getColor(QColor(current), self, "Choose Y1 axis color")
+        if not color.isValid():
+            return
+        self.push_current_undo_state()
+        self._set_y_axis_color_button(color.name())
         self.schedule_render()
         self.update_undo_baseline()
 
@@ -2261,6 +2480,14 @@ class GraphDrawerWindow(QMainWindow):
         text_color = "black" if light else "white"
         self.y2_axis_color_btn.setStyleSheet(f"background-color: {color}; color: {text_color};")
 
+    def _set_y_axis_color_button(self, color: str) -> None:
+        self.plot_config.y_axis_color = color
+        self.y_axis_color_btn.setText(color)
+        qcolor = QColor(color)
+        light = (0.299 * qcolor.red() + 0.587 * qcolor.green() + 0.114 * qcolor.blue()) > 150
+        text_color = "black" if light else "white"
+        self.y_axis_color_btn.setStyleSheet(f"background-color: {color}; color: {text_color};")
+
     def _set_color_button(self, color: str) -> None:
         self.color_btn.setText(color)
         qcolor = QColor(color)
@@ -2385,6 +2612,7 @@ class GraphDrawerWindow(QMainWindow):
         self.plot_config.tick_size = self.tick_size_spin.value()
         self.plot_config.legend_size = self.legend_size_spin.value()
         self.plot_config.y_label_offset_mm = self.y_label_offset_spin.value()
+        self.plot_config.y_axis_color = self.y_axis_color_btn.text()
         self.plot_config.y2_axis_color = self.y2_axis_color_btn.text()
         self.plot_config.pad_left_mm = self.pad_left_spin.value()
         self.plot_config.pad_right_mm = self.pad_right_spin.value()
@@ -2398,6 +2626,9 @@ class GraphDrawerWindow(QMainWindow):
         self.plot_config.x_scale = self.x_scale_combo.currentText()
         self.plot_config.y_scale = self.y_scale_combo.currentText()
         self.plot_config.y2_scale = self.y2_scale_combo.currentText()
+        self.plot_config.x_scale_divisor = self._positive_float_or_default(self.x_scale_divisor_edit, 1.0)
+        self.plot_config.y_scale_divisor = self._positive_float_or_default(self.y_scale_divisor_edit, 1.0)
+        self.plot_config.y2_scale_divisor = self._positive_float_or_default(self.y2_scale_divisor_edit, 1.0)
         self.plot_config.x_min = self._optional_float(self.x_min_edit)
         self.plot_config.x_max = self._optional_float(self.x_max_edit)
         self.plot_config.y_min = self._optional_float(self.y_min_edit)
@@ -2410,6 +2641,12 @@ class GraphDrawerWindow(QMainWindow):
         self.plot_config.x_minor_divisions = self.x_minor_divisions_spin.value()
         self.plot_config.y_minor_divisions = self.y_minor_divisions_spin.value()
         self.plot_config.y2_minor_divisions = self.y2_minor_divisions_spin.value()
+        self.plot_config.x_break_enabled = self.x_break_check.isChecked()
+        self.plot_config.x_break_left_min = self._optional_float(self.x_break_left_min_edit)
+        self.plot_config.x_break_left_max = self._optional_float(self.x_break_left_max_edit)
+        self.plot_config.x_break_right_min = self._optional_float(self.x_break_right_min_edit)
+        self.plot_config.x_break_right_max = self._optional_float(self.x_break_right_max_edit)
+        self.plot_config.x_break_gap = self.x_break_gap_spin.value()
         self.plot_config.y_break_enabled = self.y_break_check.isChecked()
         self.plot_config.y_break_lower_min = self._optional_float(self.y_break_lower_min_edit)
         self.plot_config.y_break_lower_max = self._optional_float(self.y_break_lower_max_edit)
@@ -2568,14 +2805,9 @@ class GraphDrawerWindow(QMainWindow):
     def figure_content_bbox(self, figure: Figure, annotation_artists: list, legend_artist, renderer) -> Bbox | None:
         bboxes = []
         for axis in figure.axes:
-            bboxes.append(axis.bbox)
             tight_bbox = axis.get_tightbbox(renderer)
             if tight_bbox is not None:
                 bboxes.append(tight_bbox)
-            for artist in self.axis_layout_artists(axis):
-                bbox = self.artist_window_extent(artist, renderer)
-                if bbox is not None:
-                    bboxes.append(bbox)
         for text in figure.texts:
             bbox = self.artist_window_extent(text, renderer)
             if bbox is not None:
@@ -2592,22 +2824,6 @@ class GraphDrawerWindow(QMainWindow):
     def plot_area_bbox(self, figure: Figure) -> Bbox | None:
         bboxes = [axis.bbox for axis in figure.axes if axis.get_visible()]
         return Bbox.union(bboxes) if bboxes else None
-
-    def axis_layout_artists(self, axis) -> list:
-        artists = [
-            axis.title,
-            axis._left_title,
-            axis._right_title,
-            axis.xaxis.label,
-            axis.yaxis.label,
-            axis.xaxis.get_offset_text(),
-            axis.yaxis.get_offset_text(),
-        ]
-        artists.extend(axis.get_xticklabels(minor=False))
-        artists.extend(axis.get_xticklabels(minor=True))
-        artists.extend(axis.get_yticklabels(minor=False))
-        artists.extend(axis.get_yticklabels(minor=True))
-        return [artist for artist in artists if artist is not None and artist.get_visible()]
 
     def artist_window_extent(self, artist, renderer) -> Bbox | None:
         pieces = []
@@ -3393,6 +3609,103 @@ class GraphDrawerWindow(QMainWindow):
         self.draw_annotation_handles()
         self.set_status(f"Exported figure: {path}")
 
+    def export_all_figures(self) -> None:
+        self.save_active_figure_state()
+        if not self.project_figures:
+            QMessageBox.information(self, "Export all figures", "No figures to export.")
+            return
+
+        folder = QFileDialog.getExistingDirectory(self, "Export all figures", str(self.last_folder))
+        if not folder:
+            return
+
+        output_dir = Path(folder)
+        self.last_folder = output_dir
+        self.render_timer.stop()
+
+        exported_paths: list[Path] = []
+        warnings: list[str] = []
+        reserved_paths: set[Path] = set()
+        for idx, figure in enumerate(self.project_figures, start=1):
+            config = deepcopy(figure.plot_config)
+            config.annotations = deepcopy(figure.annotations)
+            result = render_figure(
+                self._project_plot_dataframe(figure.df),
+                config,
+                self._project_series_configs(figure),
+            )
+            base_name = f"{idx:02d}_{self._safe_export_filename(figure.name)}"
+            path = self._unique_export_path(output_dir / f"{base_name}.png", reserved_paths)
+            reserved_paths.add(path)
+            export_figure(result.figure, path, config)
+            exported_paths.append(path)
+            warnings.extend(f"{figure.name}: {warning}" for warning in result.warnings)
+
+        message = f"Exported {len(exported_paths)} figures to {output_dir}"
+        if warnings:
+            message += f" | {warnings[0]}"
+        self.set_status(message)
+
+    def _project_plot_dataframe(self, df: pd.DataFrame) -> pd.DataFrame:
+        if len(df) <= DATA_START_ROW:
+            return pd.DataFrame(columns=df.columns)
+        return df.iloc[DATA_START_ROW:].reset_index(drop=True)
+
+    def _project_column_role(self, df: pd.DataFrame, column: str) -> str:
+        if column not in df.columns or len(df) <= ROLE_ROW:
+            return ""
+        value = str(df.at[ROLE_ROW, column]).strip().upper()
+        if value.startswith("X"):
+            return "X"
+        if value.startswith("Y"):
+            return "Y"
+        return ""
+
+    def _project_column_name(self, df: pd.DataFrame, column: str) -> str:
+        if column in df.columns and len(df) > NAME_ROW:
+            value = str(df.at[NAME_ROW, column]).strip()
+            if value:
+                return value
+        return column
+
+    def _project_nearest_left_x(self, df: pd.DataFrame, y_column: str) -> str:
+        columns = list(map(str, df.columns))
+        if y_column not in columns:
+            return ""
+        y_idx = columns.index(y_column)
+        for idx in range(y_idx - 1, -1, -1):
+            column = columns[idx]
+            if self._project_column_role(df, column) == "X":
+                return column
+        return ""
+
+    def _project_series_configs(self, figure: ProjectFigure) -> list[SeriesConfig]:
+        series_configs: list[SeriesConfig] = []
+        for idx, y_column in enumerate(figure.checked_y):
+            if y_column not in figure.df.columns:
+                continue
+            x_column = self._project_nearest_left_x(figure.df, y_column)
+            if not x_column:
+                continue
+            series = deepcopy(figure.series_by_y.get(y_column) or default_series(x_column, y_column, idx))
+            series.x = x_column
+            series.y = y_column
+            series.label = self._project_column_name(figure.df, y_column)
+            series_configs.append(series)
+        return series_configs
+
+    def _safe_export_filename(self, name: str) -> str:
+        safe_name = re.sub(r'[<>:"/\\|?*\x00-\x1f]+', "_", name).strip(" ._")
+        return safe_name or "figure"
+
+    def _unique_export_path(self, path: Path, reserved_paths: set[Path]) -> Path:
+        candidate = path
+        suffix = 2
+        while candidate.exists() or candidate in reserved_paths:
+            candidate = path.with_name(f"{path.stem}_{suffix}{path.suffix}")
+            suffix += 1
+        return candidate
+
     def set_annotation_handles_visible(self, visible: bool) -> None:
         for handle in self.annotation_handle_artists:
             handle.set_visible(visible)
@@ -3412,6 +3725,30 @@ class GraphDrawerWindow(QMainWindow):
         self.write_project(self.current_project_path)
         self.last_folder = self.current_project_path.parent
         self.set_status(f"Saved project: {self.current_project_path}")
+
+    def new_project(self) -> None:
+        if self._is_modified:
+            reply = QMessageBox.question(
+                self,
+                "New project",
+                "Discard unsaved changes and start a new project?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if reply != QMessageBox.Yes:
+                return
+
+        self.render_timer.stop()
+        self.create_blank_sheet()
+        self.project_figures = [self.capture_current_figure("Figure 1")]
+        self.active_figure_index = 0
+        self.current_project_path = None
+        self.undo_stack.clear()
+        self.refresh_figure_list()
+        self.load_project_figure(self.project_figures[self.active_figure_index])
+        self.undo_baseline = self.current_workspace_snapshot()
+        self._is_modified = False
+        self.set_status("Started a new project.")
 
     def write_project(self, path: Path) -> None:
         if path.suffix.lower() != ".json":
@@ -3537,6 +3874,8 @@ class GraphDrawerWindow(QMainWindow):
             self.tick_size_spin,
             self.legend_size_spin,
             self.y_label_offset_spin,
+            self.y_axis_color_btn,
+            self.y2_axis_color_btn,
             self.pad_left_spin,
             self.pad_right_spin,
             self.pad_top_spin,
@@ -3549,6 +3888,9 @@ class GraphDrawerWindow(QMainWindow):
             self.x_scale_combo,
             self.y_scale_combo,
             self.y2_scale_combo,
+            self.x_scale_divisor_edit,
+            self.y_scale_divisor_edit,
+            self.y2_scale_divisor_edit,
             self.x_min_edit,
             self.x_max_edit,
             self.y_min_edit,
@@ -3561,6 +3903,12 @@ class GraphDrawerWindow(QMainWindow):
             self.y_minor_divisions_spin,
             self.y2_tick_interval_edit,
             self.y2_minor_divisions_spin,
+            self.x_break_check,
+            self.x_break_left_min_edit,
+            self.x_break_left_max_edit,
+            self.x_break_right_min_edit,
+            self.x_break_right_max_edit,
+            self.x_break_gap_spin,
             self.y_break_check,
             self.y_break_lower_min_edit,
             self.y_break_lower_max_edit,
@@ -3593,6 +3941,7 @@ class GraphDrawerWindow(QMainWindow):
         self.tick_size_spin.setValue(self.plot_config.tick_size)
         self.legend_size_spin.setValue(self.plot_config.legend_size)
         self.y_label_offset_spin.setValue(self.plot_config.y_label_offset_mm)
+        self._set_y_axis_color_button(self.plot_config.y_axis_color)
         self._set_y2_axis_color_button(self.plot_config.y2_axis_color)
         self.pad_left_spin.setValue(self.plot_config.pad_left_mm)
         self.pad_right_spin.setValue(self.plot_config.pad_right_mm)
@@ -3606,6 +3955,9 @@ class GraphDrawerWindow(QMainWindow):
         self.x_scale_combo.setCurrentText(self.plot_config.x_scale)
         self.y_scale_combo.setCurrentText(self.plot_config.y_scale)
         self.y2_scale_combo.setCurrentText(self.plot_config.y2_scale)
+        self.x_scale_divisor_edit.setText(str(self.plot_config.x_scale_divisor))
+        self.y_scale_divisor_edit.setText(str(self.plot_config.y_scale_divisor))
+        self.y2_scale_divisor_edit.setText(str(self.plot_config.y2_scale_divisor))
         self.x_min_edit.setText("" if self.plot_config.x_min is None else str(self.plot_config.x_min))
         self.x_max_edit.setText("" if self.plot_config.x_max is None else str(self.plot_config.x_max))
         self.y_min_edit.setText("" if self.plot_config.y_min is None else str(self.plot_config.y_min))
@@ -3618,6 +3970,12 @@ class GraphDrawerWindow(QMainWindow):
         self.y_minor_divisions_spin.setValue(self.plot_config.y_minor_divisions)
         self.y2_tick_interval_edit.setText("" if self.plot_config.y2_tick_interval is None else str(self.plot_config.y2_tick_interval))
         self.y2_minor_divisions_spin.setValue(self.plot_config.y2_minor_divisions)
+        self.x_break_check.setChecked(self.plot_config.x_break_enabled)
+        self.x_break_left_min_edit.setText("" if self.plot_config.x_break_left_min is None else str(self.plot_config.x_break_left_min))
+        self.x_break_left_max_edit.setText("" if self.plot_config.x_break_left_max is None else str(self.plot_config.x_break_left_max))
+        self.x_break_right_min_edit.setText("" if self.plot_config.x_break_right_min is None else str(self.plot_config.x_break_right_min))
+        self.x_break_right_max_edit.setText("" if self.plot_config.x_break_right_max is None else str(self.plot_config.x_break_right_max))
+        self.x_break_gap_spin.setValue(self.plot_config.x_break_gap)
         self.y_break_check.setChecked(self.plot_config.y_break_enabled)
         self.y_break_lower_min_edit.setText("" if self.plot_config.y_break_lower_min is None else str(self.plot_config.y_break_lower_min))
         self.y_break_lower_max_edit.setText("" if self.plot_config.y_break_lower_max is None else str(self.plot_config.y_break_lower_max))
@@ -3647,6 +4005,20 @@ class GraphDrawerWindow(QMainWindow):
         except ValueError:
             self.set_status(f"Ignoring invalid numeric limit: {text}")
             return None
+
+    def _positive_float_or_default(self, edit: QLineEdit, default: float) -> float:
+        text = edit.text().strip()
+        if not text:
+            return default
+        try:
+            value = float(text)
+        except ValueError:
+            self.set_status(f"Ignoring invalid divisor: {text}")
+            return default
+        if value <= 0:
+            self.set_status(f"Ignoring non-positive divisor: {text}")
+            return default
+        return value
 
     def _double_spin(self, value: float, minimum: float, maximum: float, decimals: int) -> QDoubleSpinBox:
         spin = NoWheelDoubleSpinBox()
