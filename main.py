@@ -1,19 +1,16 @@
-"""Entry point for Graph_drawer."""
+"""Backward-compatible source-tree launcher for pubfig."""
 
 from __future__ import annotations
 
-import sys
+from collections.abc import Sequence
 
-from PySide6.QtWidgets import QApplication
-
-from app import GraphDrawerWindow
+from pubfig.application import main as application_main
 
 
-def main() -> int:
-    app = QApplication(sys.argv)
-    window = GraphDrawerWindow()
-    window.show()
-    return app.exec()
+def main(argv: Sequence[str] | None = None) -> int:
+    """Delegate to the packaged entry point."""
+
+    return application_main(argv)
 
 
 if __name__ == "__main__":
