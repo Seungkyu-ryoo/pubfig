@@ -76,55 +76,157 @@ class StandaloneWidgetTests(unittest.TestCase):
         tree.dropEvent(event)
         self.assertTrue(event.ignored)
 
-    def test_legend_rows_round_trip_and_preserve_layout(self) -> None:
+    def test_legend_free_text_round_trip_and_reset_to_automatic(self) -> None:
         candidates = [
             ("a", "Alpha", True),
             ("b", "Beta", True),
             ("c", "Gamma", False),
         ]
-        entries = [
-            LegendEntryConfig(source_y="a", label="A"),
-            LegendEntryConfig(source_y="b", label="B"),
-            LegendEntryConfig(source_y="c", label="C"),
-        ]
         dialog = LegendEditorDialog(
             candidates,
-            entries,
-            [2, 1],
-            automatic=False,
+            [],
+            [],
+            automatic=True,
         )
 
         self.assertEqual(
-            dialog.rows_payload(),
-            [("a", "A", True), ("b", "B", False), ("c", "C", True)],
+            dialog.text_edit.toPlainText(),
+            "\\L(1) %(1)\n\\L(2) %(2)",
         )
-        result_entries, row_lengths = dialog.result_config()
-        self.assertEqual(result_entries, entries)
-        self.assertEqual(row_lengths, [2, 1])
-
-        dialog.table.selectRow(0)
-        dialog.remove_selected_entry()
-        self.assertEqual(
-            dialog.rows_payload(),
-            [("b", "B", True), ("c", "C", True)],
-        )
-
-        dialog.reset_automatic()
-        self.assertEqual(dialog.rows_payload(), [("a", "Alpha", True), ("b", "Beta", True)])
         self.assertEqual(dialog.result_config(), (None, []))
 
-    def test_legend_add_uses_first_unused_candidate(self) -> None:
+        dialog.text_edit.setPlainText(
+            "  Measurements  \n\\L(2) Control\t\\L(1) %(1)\n\nNotes"
+        )
+        result_entries, row_lengths = dialog.result_config()
+        self.assertEqual(
+            result_entries,
+            [
+                LegendEntryConfig(label="  Measurements  "),
+                LegendEntryConfig(source_y="b", label="Control"),
+                LegendEntryConfig(source_y="a", label=""),
+                LegendEntryConfig(label=""),
+                LegendEntryConfig(label="Notes"),
+            ],
+        )
+        self.assertEqual(row_lengths, [1, 2, 1, 1])
+
+        dialog.reset_automatic()
+        self.assertEqual(
+            dialog.text_edit.toPlainText(),
+            "\\L(1) %(1)\n\\L(2) %(2)",
+        )
+        self.assertEqual(dialog.result_config(), (None, []))
+
+    def test_legend_insert_helpers_and_text_only_mode_without_series(self) -> None:
         dialog = LegendEditorDialog(
             [("a", "Alpha", True), ("b", "Beta", True)],
-            [LegendEntryConfig(source_y="a", label="Alpha")],
+            [],
             [],
             automatic=False,
         )
-        dialog.add_entry()
+        dialog.candidate_combo.setCurrentIndex(1)
+        dialog.insert_sample_and_label()
+
+        self.assertEqual(dialog.text_edit.toPlainText(), "\\L(2) %(2)")
         self.assertEqual(
-            dialog.rows_payload(),
-            [("a", "Alpha", True), ("b", "Beta", True)],
+            dialog.result_config(),
+            ([LegendEntryConfig(source_y="b", label="")], []),
         )
+
+        text_only = LegendEditorDialog([], [], [], automatic=False)
+        self.assertFalse(text_only.insert_sample_btn.isEnabled())
+        text_only.text_edit.setPlainText("Custom note")
+        self.assertEqual(
+            text_only.result_config(),
+            ([LegendEntryConfig(label="Custom note")], []),
+        )
+
+    def test_legend_editor_accepts_space_separated_samples_on_one_row(self) -> None:
+        dialog = LegendEditorDialog(
+            [("a", "Alpha", True), ("b", "Beta", True)],
+            [],
+            [],
+            automatic=False,
+        )
+        dialog.text_edit.setPlainText("\\L(1) %(1) \\L(2) %(2)")
+
+        entries, row_lengths = dialog.result_config()
+
+        self.assertEqual(
+            entries,
+            [
+                LegendEntryConfig(source_y="a", label=""),
+                LegendEntryConfig(source_y="b", label=""),
+            ],
+        )
+        self.assertEqual(row_lengths, [2])
+        self.assertEqual(len(dialog._legend_cell_ranges()), 2)
+
+        second_token = dialog.text_edit.toPlainText().index("\\L(2)")
+        cursor = dialog.text_edit.textCursor()
+        cursor.setPosition(second_token + 1)
+        dialog.text_edit.setTextCursor(cursor)
+        dialog.text_bold_btn.setChecked(True)
+        styled_entries, _rows = dialog.result_config()
+        self.assertFalse(styled_entries[0].font_bold)
+        self.assertTrue(styled_entries[1].font_bold)
+
+    def test_legend_text_format_controls_round_trip_current_entry(self) -> None:
+        candidates = [("a", "Alpha", True)]
+        dialog = LegendEditorDialog(
+            candidates,
+            [
+                LegendEntryConfig(label="HfN"),
+                LegendEntryConfig(source_y="a", label=""),
+            ],
+            [],
+            automatic=False,
+        )
+        dialog.text_edit.moveCursor(QTextCursor.Start)
+        family_index = 1 if dialog.text_font_family_combo.count() > 1 else 0
+        family = str(dialog.text_font_family_combo.itemData(family_index) or "")
+
+        dialog.text_font_family_combo.setCurrentIndex(family_index)
+        dialog.text_font_size_spin.setValue(12.5)
+        dialog.text_bold_btn.setChecked(True)
+        dialog.text_italic_btn.setChecked(True)
+        dialog.set_current_text_color("#336699")
+
+        self.assertEqual(dialog.text_edit.toPlainText(), "HfN\n\\L(1) %(1)")
+        entries, row_lengths = dialog.result_config()
+        self.assertEqual(row_lengths, [])
+        self.assertEqual(
+            entries,
+            [
+                LegendEntryConfig(
+                    label="HfN",
+                    font_family=family,
+                    font_size=12.5,
+                    font_bold=True,
+                    font_italic=True,
+                    text_color="#336699",
+                ),
+                LegendEntryConfig(source_y="a", label=""),
+            ],
+        )
+
+        reopened = LegendEditorDialog(
+            candidates,
+            entries,
+            row_lengths,
+            automatic=False,
+        )
+        reopened.text_edit.moveCursor(QTextCursor.Start)
+        self.assertEqual(reopened.result_config(), (entries, row_lengths))
+        self.assertEqual(reopened.text_font_size_spin.value(), 12.5)
+        self.assertTrue(reopened.text_bold_btn.isChecked())
+        self.assertTrue(reopened.text_italic_btn.isChecked())
+        self.assertEqual(reopened.text_color_btn.text(), "#336699")
+
+        reopened.reset_current_text_format()
+        reset_entries, _reset_rows = reopened.result_config()
+        self.assertEqual(reset_entries[0], LegendEntryConfig(label="HfN"))
 
     def test_gradient_validation_sorting_and_interpolation(self) -> None:
         editor = GradientEditorWidget()

@@ -6,7 +6,9 @@ widget state, but the objects below are the canonical persisted project state.
 
 from __future__ import annotations
 
+import unicodedata
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Iterator, Literal
 from uuid import uuid4
 
@@ -34,7 +36,7 @@ class Sheet:
     df: pd.DataFrame
 
 
-@dataclass
+@dataclass(init=False)
 class Graph:
     """A plot definition that references exactly one :class:`Sheet`."""
 
@@ -44,7 +46,37 @@ class Graph:
     plot_config: PlotConfig = field(default_factory=PlotConfig)
     series_by_y: dict[str, SeriesConfig] = field(default_factory=dict)
     checked_y: list[str] = field(default_factory=list)
-    annotations: list[AnnotationConfig] = field(default_factory=list)
+    def __init__(
+        self,
+        id: str,
+        name: str,
+        sheet_id: str,
+        plot_config: PlotConfig | None = None,
+        series_by_y: dict[str, SeriesConfig] | None = None,
+        checked_y: list[str] | None = None,
+        annotations: list[AnnotationConfig] | None = None,
+    ) -> None:
+        self.id = id
+        self.name = name
+        self.sheet_id = sheet_id
+        self.plot_config = plot_config if plot_config is not None else PlotConfig()
+        self.series_by_y = series_by_y if series_by_y is not None else {}
+        self.checked_y = checked_y if checked_y is not None else []
+        if annotations is not None:
+            self.annotations = annotations
+        elif self.plot_config.annotations is None:
+            self.plot_config.annotations = []
+
+    @property
+    def annotations(self) -> list[AnnotationConfig]:
+        """Legacy accessor for the single annotation list owned by PlotConfig."""
+        if self.plot_config.annotations is None:
+            self.plot_config.annotations = []
+        return self.plot_config.annotations
+
+    @annotations.setter
+    def annotations(self, value: list[AnnotationConfig]) -> None:
+        self.plot_config.annotations = value
 
 
 @dataclass
@@ -152,6 +184,16 @@ class ProjectDocument:
     graphs: dict[str, Graph] = field(default_factory=dict)
     tree_root: TreeNode = field(default_factory=project_root)
     active_node_id: str | None = None
+    # These fields describe the exact on-disk generation from which the
+    # document was opened.  They are deliberately excluded from equality and
+    # project serialization: their only purpose is optimistic conflict
+    # detection when Save would replace that same pathname.
+    source_path: Path | None = field(default=None, repr=False, compare=False)
+    source_revision: tuple[int, int, int, int] | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
 
     @property
     def tree(self) -> TreeNode:
@@ -177,6 +219,58 @@ class ProjectDocument:
 
     def repair(self) -> RepairReport:
         return repair_document(self)
+
+    def rename_node(self, node_id: str, name: str) -> bool:
+        """Rename one project node and its canonical backing object.
+
+        Sheet and graph names are persisted twice in schema v3: once on the
+        object and once on its tree node.  Keeping this mutation on the model
+        prevents a tree-only rename from appearing to work until the next
+        load repairs it back to the object name.
+        """
+
+        node = self.find_node(node_id)
+        normalized = unicodedata.normalize("NFC", str(name).strip())
+        if node is None or not normalized:
+            return False
+
+        changed = False
+        if node.type == "sheet" and node.ref_id in self.sheets:
+            target = self.sheets[node.ref_id]
+            changed = target.name != normalized
+            target.name = normalized
+            for candidate in self.iter_nodes():
+                if candidate.type == "sheet" and candidate.ref_id == node.ref_id:
+                    changed = changed or candidate.name != normalized
+                    candidate.name = normalized
+        elif node.type == "graph" and node.ref_id in self.graphs:
+            target = self.graphs[node.ref_id]
+            changed = target.name != normalized
+            target.name = normalized
+            for candidate in self.iter_nodes():
+                if candidate.type == "graph" and candidate.ref_id == node.ref_id:
+                    changed = changed or candidate.name != normalized
+                    candidate.name = normalized
+        else:
+            changed = node.name != normalized
+            node.name = normalized
+        return changed
+
+    def synchronize_tree_names(self) -> int:
+        """Make sheet/graph tree labels match their canonical object names."""
+
+        changed = 0
+        for node in self.iter_nodes():
+            if node.type == "sheet" and node.ref_id in self.sheets:
+                canonical = self.sheets[node.ref_id].name
+            elif node.type == "graph" and node.ref_id in self.graphs:
+                canonical = self.graphs[node.ref_id].name
+            else:
+                continue
+            if node.name != canonical:
+                node.name = canonical
+                changed += 1
+        return changed
 
 
 def repair_document(document: ProjectDocument) -> RepairReport:

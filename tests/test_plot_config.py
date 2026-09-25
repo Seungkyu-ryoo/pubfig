@@ -6,6 +6,7 @@ import unittest
 from plot_config import (
     LegendEntryConfig,
     PlotConfig,
+    legend_entry_config_from_payload,
     plot_config_from_payload,
 )
 
@@ -23,7 +24,15 @@ class PlotConfigTests(unittest.TestCase):
         config = PlotConfig(
             legend_entries=[
                 LegendEntryConfig(source_y="Col 4", label="Control"),
-                LegendEntryConfig(source_y="Col 2", label="Sample"),
+                LegendEntryConfig(
+                    source_y="Col 2",
+                    label="Sample",
+                    font_family="Arial",
+                    font_size=9.5,
+                    font_bold=True,
+                    font_italic=True,
+                    text_color="#336699",
+                ),
             ],
             legend_row_lengths=[2],
         )
@@ -39,6 +48,21 @@ class PlotConfigTests(unittest.TestCase):
         )
         self.assertEqual(restored.legend_row_lengths, [2])
 
+    def test_legacy_legend_entry_payload_uses_default_text_style(self) -> None:
+        restored = legend_entry_config_from_payload(
+            {"source_y": "Col 2", "label": "Legacy"}
+        )
+
+        self.assertEqual(
+            restored,
+            LegendEntryConfig(source_y="Col 2", label="Legacy"),
+        )
+        self.assertEqual(restored.font_family, "")
+        self.assertIsNone(restored.font_size)
+        self.assertFalse(restored.font_bold)
+        self.assertFalse(restored.font_italic)
+        self.assertEqual(restored.text_color, "")
+
     def test_legacy_plot_config_keeps_automatic_legend_mode(self) -> None:
         restored = plot_config_from_payload({"legend": True})
 
@@ -48,6 +72,7 @@ class PlotConfigTests(unittest.TestCase):
         restored = plot_config_from_payload({})
 
         self.assertEqual(restored.axis_line_width, 0.5)
+        self.assertEqual(restored.y_label_offset_mm, 6.0)
         self.assertTrue(restored.show_tick_marks)
         self.assertFalse(restored.show_axis_arrows)
         self.assertTrue(restored.show_top_axis)

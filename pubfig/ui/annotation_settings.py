@@ -27,13 +27,13 @@ from PySide6.QtWidgets import (
 )
 
 from ..plot_config import ANNOTATION_LINE_STYLES, AnnotationConfig
-from ..theme import color_swatch_style
-from .binding import BindingRegistry, FieldBinding, signals_blocked
+from ..theme import style_color_button
+from .binding import BindingRegistry, FieldBinding, change_signal, signals_blocked
 from .widgets import (
+    integer_spin,
     AnnotationTextEdit,
     NoWheelComboBox,
     NoWheelDoubleSpinBox,
-    NoWheelSpinBox,
 )
 
 
@@ -109,19 +109,9 @@ class AnnotationSettingsPanel(QGroupBox):
         spin.setMinimumWidth(86)
         return spin
 
-    @staticmethod
-    def _integer(value: int, minimum: int, maximum: int) -> NoWheelSpinBox:
-        spin = NoWheelSpinBox()
-        spin.setRange(minimum, maximum)
-        spin.setValue(value)
-        spin.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-        spin.setMinimumWidth(86)
-        return spin
+    _integer = staticmethod(integer_spin)
 
-    @staticmethod
-    def _set_color(button: QPushButton, color: str) -> None:
-        button.setText(str(color))
-        button.setStyleSheet(color_swatch_style(str(color)))
+    _set_color = staticmethod(style_color_button)
 
     def _build_controls(self) -> None:
         self.list_widget = QListWidget()
@@ -189,13 +179,7 @@ class AnnotationSettingsPanel(QGroupBox):
         style_form.addRow("Color", self.color_button)
         self.tabs.addTab(style_tab, "Style")
 
-    @staticmethod
-    def _signal(widget: QWidget):
-        for name in ("textChanged", "currentTextChanged", "valueChanged", "toggled"):
-            signal = getattr(widget, name, None)
-            if signal is not None:
-                return signal
-        return None
+    _signal = staticmethod(change_signal)
 
     @staticmethod
     def _write_known_combo(

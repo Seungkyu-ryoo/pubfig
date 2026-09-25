@@ -64,12 +64,19 @@ def coerce_numeric(series: pd.Series) -> pd.Series:
 
 
 def parse_clipboard_grid(text: str) -> list[list[str]]:
-    """Parse clipboard text as plain cells without header inference."""
+    """Parse spreadsheet clipboard text as plain cells without inference.
+
+    Spreadsheet applications encode columns with tabs and rows with newlines.
+    Ordinary spaces, commas, and semicolons can all be part of one cell's text,
+    so delimiter auto-detection belongs only in :func:`parse_table_text` when
+    importing a complete table.
+    """
     cleaned = _normalize_text(text)
     if not cleaned:
         return []
-    _, sep = _detect_separator(cleaned)
-    return _read_rows(cleaned, sep)
+    if "\t" in cleaned:
+        return _read_rows(cleaned, "\t")
+    return [[line] for line in cleaned.splitlines() if line.strip()]
 
 
 def _normalize_text(text: str) -> str:

@@ -23,11 +23,7 @@ from PySide6.QtCore import (
 from PySide6.QtGui import QKeySequence
 from PySide6.QtWidgets import QApplication, QTableView
 
-from .sheet_data import next_column_name
-
-
-ROLE_ROW = 0
-NAME_ROW = 1
+from .sheet_data import NAME_ROW, ROLE_ROW, next_column_name
 
 
 class DataFrameTableModel(QAbstractTableModel):
@@ -376,6 +372,7 @@ class SpreadsheetTableWidget(QTableView):
     copied = Signal(str)
     delete_requested = Signal()
     itemChanged = Signal(object)
+    dataframeChanged = Signal()
 
     def __init__(self) -> None:
         super().__init__()
@@ -389,6 +386,7 @@ class SpreadsheetTableWidget(QTableView):
 
     def set_dataframe(self, df: pd.DataFrame) -> None:
         self.table_model.set_dataframe(df)
+        self.dataframeChanged.emit()
 
     def dataframe_copy(self) -> pd.DataFrame:
         return self.table_model.dataframe_copy()
@@ -413,6 +411,7 @@ class SpreadsheetTableWidget(QTableView):
 
     def set_block(self, start_row: int, start_column: int, grid: list[list[str]]) -> None:
         self.table_model.set_block(start_row, start_column, grid)
+        self.dataframeChanged.emit()
 
     def fill_range(self, selected: TableSelectionRange, text: str) -> None:
         self.table_model.fill_range(
@@ -422,6 +421,7 @@ class SpreadsheetTableWidget(QTableView):
             selected.rightColumn(),
             text,
         )
+        self.dataframeChanged.emit()
 
     def currentItem(self) -> CellAdapter | None:
         index = self.currentIndex()
@@ -482,15 +482,24 @@ class SpreadsheetTableWidget(QTableView):
 
     def setHorizontalHeaderItem(self, column: int, item) -> None:
         text = item.text() if item is not None and hasattr(item, "text") else ""
+        self.rename_column(column, text)
+
+    def rename_column(self, column: int, text: str) -> None:
         self.table_model.rename_column(column, text)
+        self.dataframeChanged.emit()
 
     def setHorizontalHeaderLabels(self, labels: list[str]) -> None:
         self.table_model.set_column_names(labels)
+        self.dataframeChanged.emit()
 
     def set_display_header(self, column: int, label: str) -> None:
         self.table_model.set_display_header(column, label)
 
     def setVerticalHeaderLabels(self, _labels: list[str]) -> None:
+        """Legacy QTableWidget adapter; row labels are computed on demand."""
+        self.refresh_row_headers()
+
+    def refresh_row_headers(self) -> None:
         if self.rowCount():
             self.table_model.headerDataChanged.emit(Qt.Vertical, 0, self.rowCount() - 1)
 
@@ -499,27 +508,35 @@ class SpreadsheetTableWidget(QTableView):
 
     def setRowCount(self, count: int) -> None:
         self.table_model.set_row_count(count)
+        self.dataframeChanged.emit()
 
     def setColumnCount(self, count: int) -> None:
         self.table_model.set_column_count(count)
+        self.dataframeChanged.emit()
 
     def insertRow(self, row: int) -> None:
         self.table_model.insert_row(row)
+        self.dataframeChanged.emit()
 
     def removeRow(self, row: int) -> None:
         self.table_model.remove_row(row)
+        self.dataframeChanged.emit()
 
     def removeRows(self, row: int, count: int) -> None:
         self.table_model.remove_rows(row, count)
+        self.dataframeChanged.emit()
 
     def insertColumn(self, column: int, name: str | None = None) -> None:
         self.table_model.insert_column(column, name)
+        self.dataframeChanged.emit()
 
     def removeColumn(self, column: int) -> None:
         self.table_model.remove_column(column)
+        self.dataframeChanged.emit()
 
     def removeColumns(self, column: int, count: int) -> None:
         self.table_model.remove_columns(column, count)
+        self.dataframeChanged.emit()
 
     def keyPressEvent(self, event):
         if event.modifiers() & Qt.ControlModifier and event.key() in (

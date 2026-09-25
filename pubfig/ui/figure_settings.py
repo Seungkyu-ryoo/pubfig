@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import math
 from collections.abc import Callable, Iterable
+from dataclasses import replace
+from sys import float_info
 from typing import Any
 
 from PySide6.QtCore import Signal
@@ -21,9 +23,9 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from ..plot_config import PRESETS, PlotConfig
-from ..theme import color_swatch_style
-from .binding import BindingRegistry, FieldBinding
+from ..plot_config import PRESETS, TICK_NOTATIONS, PlotConfig, axis_tick_notation
+from ..theme import style_color_button
+from .binding import BindingRegistry, FieldBinding, change_signal, optional_float
 
 
 PLOT_RATIO_PRESETS: dict[str, float | None] = {
@@ -44,20 +46,22 @@ PLOT_RATIO_PRESETS: dict[str, float | None] = {
 }
 
 
-def _optional_float(edit: QLineEdit) -> float | None:
-    text = edit.text().strip()
-    if not text:
-        return None
-    try:
-        value = float(text)
-    except ValueError:
-        return None
-    return value if math.isfinite(value) else None
+_optional_float = optional_float
 
 
 def _positive_float(edit: QLineEdit) -> float:
     value = _optional_float(edit)
-    return value if value is not None and value > 0 else 1.0
+    if value is not None and value > 0:
+        edit.setProperty("last_valid_divisor", value)
+        return value
+    # Incomplete input such as '1e' must not reset an existing scale to 1.
+    return float(edit.property("last_valid_divisor") or 1.0)
+
+
+def _set_divisor(edit: QLineEdit, value: float) -> None:
+    # Reset the fallback when switching graphs or restoring undo history.
+    edit.setProperty("last_valid_divisor", value if math.isfinite(value) and value > 0 else 1.0)
+    edit.setText(str(value))
 
 
 def _optional_text(value: float | None) -> str:
@@ -125,10 +129,11 @@ class FigureSettingsPanel(QGroupBox):
         self.y_label_edit = QLineEdit()
         self.y2_label_edit = QLineEdit()
 
-        self.width_spin = self._double(c.width_mm, 20.0, 300.0, 1)
-        self.height_spin = self._double(c.height_mm, 20.0, 300.0, 1)
-        self.plot_width_spin = self._double(c.plot_width_mm, 1.0, 300.0, 1)
-        self.plot_height_spin = self._double(c.plot_height_mm, 1.0, 300.0, 1)
+        # Allow poster-sized figures without an arbitrary physical-size cap.
+        self.width_spin = self._double(c.width_mm, 20.0, float_info.max, 1)
+        self.height_spin = self._double(c.height_mm, 20.0, float_info.max, 1)
+        self.plot_width_spin = self._double(c.plot_width_mm, 1.0, float_info.max, 1)
+        self.plot_height_spin = self._double(c.plot_height_mm, 1.0, float_info.max, 1)
         self.plot_ratio_lock_check = QCheckBox("Lock plot ratio")
         self.plot_ratio_preset_combo = self._combo(PLOT_RATIO_PRESETS, c.plot_ratio_preset)
         self.dpi_spin = self._integer(c.dpi, 72, 1200)
@@ -183,15 +188,48 @@ class FigureSettingsPanel(QGroupBox):
         for edit in (self.x_tick_interval_edit, self.y_tick_interval_edit, self.y2_tick_interval_edit):
             edit.setPlaceholderText("auto; log: decades")
             edit.setToolTip(
-                "Linear scale: data-unit interval. Log scale: decade interval."
+                "Linear scale: original data-unit interval, unaffected by divisor. "
+                "Log scale: decade interval."
             )
         for edit in (self.x_scale_divisor_edit, self.y_scale_divisor_edit, self.y2_scale_divisor_edit):
             edit.setPlaceholderText("1")
-            edit.setToolTip("Plot values are divided by this positive number.")
+            edit.setProperty("positive_only", True)
+            edit.setToolTip(
+                "Tick label = original axis value / divisor. Curves and axis limits stay unchanged. "
+                "Enter a finite positive number "
+                "such as 1000000 or 1e6 (not 10^6). Use 0.001 to convert seconds to ms. "
+                "Axis limits and tick intervals remain in original data units. "
+                "Invalid or incomplete input keeps the last valid divisor; enter 1 to reset."
+            )
+        for axis in ("x", "y", "y2"):
+            for bound in ("min", "max"):
+                getattr(self, f"{axis}_{bound}_edit").setToolTip(
+                    "Axis limit in original data units, unaffected by divisor. Blank uses automatic limits."
+                )
 
         self.x_minor_divisions_spin = self._integer(c.x_minor_divisions, 0, 20)
         self.y_minor_divisions_spin = self._integer(c.y_minor_divisions, 0, 20)
         self.y2_minor_divisions_spin = self._integer(c.y2_minor_divisions, 0, 20)
+        for axis in ("x", "y", "y2"):
+            spin = self._integer(-1, -1, 12)
+            spin.setSpecialValueText("Auto")
+            spin.setToolTip(
+                "Decimal places in numeric tick labels (0–12). "
+                "Auto uses automatic precision; 2 displays 1.00. "
+                "In scientific formats this controls the coefficient's decimals. "
+                "Only labels change, not the data or tick spacing."
+            )
+            setattr(self, f"{axis}_tick_decimals_spin", spin)
+            combo = QComboBox()
+            for mode, label in TICK_NOTATIONS.items():
+                combo.addItem(label, mode)
+            combo.setToolTip(
+                "Plain: 1000000. Each tick: 1×10⁶, 2×10⁶. "
+                "Shared exponent: ticks 1, 2 with ×10⁶ at the axis edge. "
+                "Auto chooses notation from the axis scale and value range. "
+                "Formatting applies after the divisor."
+            )
+            setattr(self, f"{axis}_tick_notation_combo", combo)
         self.x_break_check = QCheckBox("X broken axis")
         self.y_break_check = QCheckBox("Y broken axis")
         self.x_break_gap_spin = self._double(c.x_break_gap, 0.01, 0.5, 3)
@@ -257,10 +295,16 @@ class FigureSettingsPanel(QGroupBox):
             ("Y min", self.y_min_edit), ("Y max", self.y_max_edit),
             ("Y2 min", self.y2_min_edit), ("Y2 max", self.y2_max_edit),
             ("X tick interval", self.x_tick_interval_edit),
+            ("X tick decimals", self.x_tick_decimals_spin),
+            ("X number format", self.x_tick_notation_combo),
             ("X minor divisions", self.x_minor_divisions_spin),
             ("Y tick interval", self.y_tick_interval_edit),
+            ("Y tick decimals", self.y_tick_decimals_spin),
+            ("Y number format", self.y_tick_notation_combo),
             ("Y minor divisions", self.y_minor_divisions_spin),
             ("Y2 tick interval", self.y2_tick_interval_edit),
+            ("Y2 tick decimals", self.y2_tick_decimals_spin),
+            ("Y2 number format", self.y2_tick_notation_combo),
             ("Y2 minor divisions", self.y2_minor_divisions_spin),
             (None, self.x_break_check), ("X break left min", self.x_break_left_min_edit),
             ("X break left max", self.x_break_left_max_edit),
@@ -286,18 +330,9 @@ class FigureSettingsPanel(QGroupBox):
             (None, self.grid_check), (None, self.legend_check), (None, self.edit_legend_btn),
         ))
 
-    @staticmethod
-    def _signal(widget: QWidget):
-        for name in ("textChanged", "currentTextChanged", "valueChanged", "toggled"):
-            signal = getattr(widget, name, None)
-            if signal is not None:
-                return signal
-        return None
+    _signal = staticmethod(change_signal)
 
-    @staticmethod
-    def _set_color(button: QPushButton, color: str) -> None:
-        button.setText(color)
-        button.setStyleSheet(color_swatch_style(color))
+    _set_color = staticmethod(style_color_button)
 
     @staticmethod
     def _set_combo_with_fallback(
@@ -376,11 +411,27 @@ class FigureSettingsPanel(QGroupBox):
             "grid": self.grid_check, "legend": self.legend_check,
         }
         bindings = [self._standard_binding(field, widget) for field, widget in names.items()]
+        for axis in ("x", "y", "y2"):
+            combo = getattr(self, f"{axis}_tick_notation_combo")
+            bindings.append(FieldBinding(
+                f"{axis}_tick_notation", combo, combo.currentData,
+                lambda value, target=combo: target.setCurrentIndex(
+                    max(0, target.findData(value))
+                ), combo.currentIndexChanged,
+            ))
+            field = f"{axis}_tick_decimals"
+            spin = getattr(self, f"{field}_spin")
+            bindings.append(FieldBinding(
+                field, spin,
+                lambda target=spin: None if target.value() < 0 else target.value(),
+                lambda value, target=spin: target.setValue(-1 if value is None else value),
+                spin.valueChanged,
+            ))
         for field in ("x_scale_divisor", "y_scale_divisor", "y2_scale_divisor"):
             edit = getattr(self, f"{field}_edit")
             bindings.append(FieldBinding(
                 field, edit, lambda target=edit: _positive_float(target),
-                lambda value, target=edit: target.setText(str(value)), edit.textChanged,
+                lambda value, target=edit: _set_divisor(target, value), edit.textChanged,
             ))
         optional_fields = (
             "x_min", "x_max", "y_min", "y_max", "y2_min", "y2_max",
@@ -406,10 +457,19 @@ class FigureSettingsPanel(QGroupBox):
         setattr(target, "_numeric_edits", self._numeric_edits)
 
     def load(self, config: PlotConfig) -> None:
-        self.bindings.load(config)
+        self.bindings.load(replace(config, **{
+            f"{axis}_tick_notation": axis_tick_notation(config, axis)
+            for axis in ("x", "y", "y2")
+        }))
+        for edit in self._numeric_edits:
+            self._refresh_numeric_edit_validity(edit)
 
     def update(self, config: PlotConfig) -> PlotConfig:
-        return self.bindings.update(config)
+        self.bindings.update(config)
+        for axis in ("x", "y", "y2"):
+            setattr(config, f"{axis}_scientific_notation",
+                    getattr(config, f"{axis}_tick_notation") != "plain")
+        return config
 
     def connect_changed(self, callback: Callable[[QWidget], None]) -> None:
         """Call ``callback`` with the widget that originated each change."""
@@ -426,10 +486,12 @@ class FigureSettingsPanel(QGroupBox):
     @staticmethod
     def _refresh_numeric_edit_validity(edit: QLineEdit) -> None:
         text = edit.text().strip()
-        valid = not text
+        positive_only = bool(edit.property("positive_only"))
+        valid = not text and not positive_only
         if text:
             try:
-                valid = math.isfinite(float(text))
+                value = float(text)
+                valid = math.isfinite(value) and (not positive_only or value > 0)
             except ValueError:
                 valid = False
         edit.setProperty("invalid", not valid)

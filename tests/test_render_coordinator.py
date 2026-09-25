@@ -13,6 +13,7 @@ from pubfig.rendering import (
     ExportJob,
     ExportOutcome,
     RenderCoordinator,
+    RenderOptions,
     RenderRequest,
     RenderResult,
 )
@@ -84,6 +85,35 @@ class RenderCoordinatorTests(unittest.TestCase):
         self.assertIs(self.rendered[0][0].dataframe, self.frame)
         self.assertIs(self.rendered[0][0].config, self.config)
         self.assertEqual(self.rendered[0][0].series_configs, tuple(self.series))
+
+    def test_preview_options_are_used_for_display_but_not_export_outputs(self) -> None:
+        observed_options: list[RenderOptions] = []
+
+        def option_aware_render(frame, config, series, *, options):
+            observed_options.append(options)
+            return RenderResult(_FakeFigure(), [], [])
+
+        coordinator = RenderCoordinator(
+            render=option_aware_render,
+            export=lambda _figure, _path, _config: None,
+            canvas_factory=_FakeCanvas,
+        )
+        request = RenderRequest(
+            self.frame,
+            self.config,
+            self.series,
+            render_options=RenderOptions.for_preview(64),
+        )
+
+        displayed = coordinator.render_for_display(request, lambda _result: None)
+        self.addCleanup(coordinator.cleanup, displayed)
+        coordinator.render_bytes(request)
+        coordinator.export_one(ExportJob(request, "full.png"))
+
+        self.assertTrue(observed_options[0].preview)
+        self.assertEqual(observed_options[0].preview_point_limit, 64)
+        self.assertFalse(observed_options[1].preview)
+        self.assertFalse(observed_options[2].preview)
 
     def test_display_callback_failure_cleans_before_reraising(self) -> None:
         def reject(_result):

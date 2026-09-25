@@ -2,6 +2,8 @@
 
 from pubfig.rendering import (
     ArrowAnnotationArtist,
+    NumericColumnCache,
+    RenderOptions,
     RenderResult,
     export_figure,
     mm_to_inch,
@@ -10,6 +12,8 @@ from pubfig.rendering import (
 
 __all__ = [
     "ArrowAnnotationArtist",
+    "NumericColumnCache",
+    "RenderOptions",
     "RenderResult",
     "export_figure",
     "mm_to_inch",

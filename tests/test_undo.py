@@ -120,6 +120,189 @@ class UndoManagerTests(unittest.TestCase):
         self.assertFalse(history.undo())
         self.assertEqual(history.redo_count, 50)
 
+    def test_weight_limit_keeps_the_newest_contiguous_undo_entries(self) -> None:
+        self.workspace.state["weight"] = 4
+        history = UndoManager(
+            self.workspace.capture,
+            self.workspace.restore,
+            snapshot_weight=lambda snapshot: snapshot["weight"],
+            max_stack_weight=8,
+            clock=self.clock,
+        )
+        history.reset()
+
+        for value in (1, 2, 3):
+            self.assertTrue(history.checkpoint_current())
+            self.set_value(value)
+            history.refresh_baseline()
+
+        self.assertEqual(history.baseline_weight, 4)
+        self.assertEqual((history.undo_count, history.undo_weight), (2, 8))
+        self.assertTrue(history.undo())
+        self.assertEqual(self.workspace.state["value"], 2)
+        self.assertTrue(history.undo())
+        self.assertEqual(self.workspace.state["value"], 1)
+        self.assertFalse(history.undo())
+        self.assertEqual((history.redo_count, history.redo_weight), (2, 8))
+
+    def test_live_shared_resource_is_not_charged_per_style_snapshot(self) -> None:
+        self.workspace.state["resource"] = "large-live-frame"
+        history = UndoManager(
+            self.workspace.capture,
+            self.workspace.restore,
+            snapshot_resources=lambda snapshot: {snapshot["resource"]: 1_000},
+            max_stack_weight=10,
+            clock=self.clock,
+        )
+        history.reset()
+
+        self.assertTrue(history.checkpoint_current())
+        self.set_value(1)
+        history.refresh_baseline()
+
+        self.assertEqual((history.undo_count, history.undo_weight), (1, 0))
+        self.assertTrue(history.undo())
+        self.assertEqual(self.workspace.state["value"], 0)
+
+    def test_history_only_resources_are_deduplicated_and_budgeted(self) -> None:
+        self.workspace.state["resource"] = "frame-a"
+        history = UndoManager(
+            self.workspace.capture,
+            self.workspace.restore,
+            snapshot_resources=lambda snapshot: {snapshot["resource"]: 10},
+            max_stack_weight=15,
+            clock=self.clock,
+        )
+        history.reset()
+
+        history.checkpoint_current()
+        self.workspace.state.update(value=1, resource="frame-b")
+        history.refresh_baseline()
+        self.assertEqual((history.undo_count, history.undo_weight), (1, 10))
+
+        history.checkpoint_current()
+        self.workspace.state.update(value=2, resource="frame-c")
+        history.refresh_baseline()
+
+        # Retaining both old buffers would exceed the limit, so the oldest
+        # state is removed while the newest contiguous undo remains valid.
+        self.assertEqual((history.undo_count, history.undo_weight), (1, 10))
+        self.assertTrue(history.undo())
+        self.assertEqual(self.workspace.state["value"], 1)
+
+    def test_oversized_checkpoint_clears_history_instead_of_skipping_state(self) -> None:
+        self.workspace.state["weight"] = 4
+        history = UndoManager(
+            self.workspace.capture,
+            self.workspace.restore,
+            snapshot_weight=lambda snapshot: snapshot["weight"],
+            max_stack_weight=8,
+            clock=self.clock,
+        )
+        history.reset()
+        self.assertTrue(history.checkpoint_current())
+        self.set_value(1)
+        history.refresh_baseline()
+
+        self.workspace.state["weight"] = 9
+        self.assertFalse(history.checkpoint_current())
+        self.assertEqual((history.undo_count, history.undo_weight), (0, 0))
+        self.assertEqual((history.redo_count, history.redo_weight), (0, 0))
+        self.assertFalse(history.undo())
+
+    def test_undo_succeeds_but_drops_oversized_outgoing_redo_state(self) -> None:
+        self.workspace.state["weight"] = 4
+        history = UndoManager(
+            self.workspace.capture,
+            self.workspace.restore,
+            snapshot_weight=lambda snapshot: snapshot["weight"],
+            max_stack_weight=8,
+            clock=self.clock,
+        )
+        history.reset()
+        self.assertTrue(history.checkpoint_current())
+        self.set_value(1)
+        self.workspace.state["weight"] = 9
+        history.refresh_baseline()
+
+        self.assertTrue(history.undo())
+        self.assertEqual(self.workspace.state["value"], 0)
+        self.assertFalse(history.can_redo)
+        self.assertEqual(history.redo_weight, 0)
+
+    def test_redo_succeeds_but_drops_oversized_outgoing_undo_state(self) -> None:
+        self.workspace.state["weight"] = 4
+        history = UndoManager(
+            self.workspace.capture,
+            self.workspace.restore,
+            snapshot_weight=lambda snapshot: snapshot["weight"],
+            max_stack_weight=8,
+            clock=self.clock,
+        )
+        history.reset()
+        history.checkpoint_current()
+        self.set_value(1)
+        history.refresh_baseline()
+        self.assertTrue(history.undo())
+
+        self.workspace.state["weight"] = 9
+        self.assertTrue(history.redo())
+        self.assertEqual(self.workspace.state["value"], 1)
+        self.assertFalse(history.can_undo)
+        self.assertEqual(history.undo_weight, 0)
+
+    def test_restore_failure_keeps_weighted_stacks_unchanged(self) -> None:
+        self.workspace.state["weight"] = 4
+
+        def restore(_snapshot: dict) -> None:
+            raise RuntimeError("restore failed")
+
+        history = UndoManager(
+            self.workspace.capture,
+            restore,
+            snapshot_weight=lambda snapshot: snapshot["weight"],
+            max_stack_weight=8,
+            clock=self.clock,
+        )
+        history.reset()
+        history.checkpoint_current()
+        self.set_value(1)
+        history.refresh_baseline()
+
+        with self.assertRaisesRegex(RuntimeError, "restore failed"):
+            history.undo()
+        self.assertEqual(self.workspace.state["value"], 1)
+        self.assertEqual((history.undo_count, history.undo_weight), (1, 4))
+        self.assertEqual((history.redo_count, history.redo_weight), (0, 0))
+
+    def test_weight_callback_failure_does_not_mutate_history_or_workspace(self) -> None:
+        self.workspace.state["weight"] = 4
+        fail = False
+
+        def snapshot_weight(snapshot: dict) -> int:
+            if fail:
+                raise RuntimeError("weight failed")
+            return snapshot["weight"]
+
+        history = UndoManager(
+            self.workspace.capture,
+            self.workspace.restore,
+            snapshot_weight=snapshot_weight,
+            max_stack_weight=8,
+            clock=self.clock,
+        )
+        history.reset()
+        history.checkpoint_current()
+        self.set_value(1)
+        history.refresh_baseline()
+        fail = True
+
+        with self.assertRaisesRegex(RuntimeError, "weight failed"):
+            history.undo()
+        self.assertEqual(self.workspace.state["value"], 1)
+        self.assertEqual((history.undo_count, history.undo_weight), (1, 4))
+        self.assertEqual((history.redo_count, history.redo_weight), (0, 0))
+
     def test_suspension_and_restore_callbacks_do_not_record_reentrantly(self) -> None:
         reentrant_results: list[bool] = []
 
@@ -217,6 +400,61 @@ class UndoManagerTests(unittest.TestCase):
                 self.workspace.restore,
                 coalesce_interval=-0.1,
             )
+        with self.assertRaises(ValueError):
+            UndoManager(
+                self.workspace.capture,
+                self.workspace.restore,
+                snapshot_weight=lambda _snapshot: 1,
+            )
+        with self.assertRaises(ValueError):
+            UndoManager(
+                self.workspace.capture,
+                self.workspace.restore,
+                max_stack_weight=8,
+            )
+        with self.assertRaises(ValueError):
+            UndoManager(
+                self.workspace.capture,
+                self.workspace.restore,
+                snapshot_resources=lambda _snapshot: {},
+            )
+        for invalid in (0, -1, True, 1.5):
+            with self.subTest(max_stack_weight=invalid):
+                with self.assertRaises(ValueError):
+                    UndoManager(
+                        self.workspace.capture,
+                        self.workspace.restore,
+                        snapshot_weight=lambda _snapshot: 1,
+                        max_stack_weight=invalid,
+                    )
+
+        for invalid_weight in (-1, True, 1.5):
+            with self.subTest(snapshot_weight=invalid_weight):
+                history = UndoManager(
+                    self.workspace.capture,
+                    self.workspace.restore,
+                    snapshot_weight=lambda _snapshot, value=invalid_weight: value,
+                    max_stack_weight=8,
+                )
+                with self.assertRaises(ValueError):
+                    history.reset()
+
+        invalid_resources = (
+            [],
+            {"buffer": -1},
+            {"buffer": True},
+            {"buffer": 1.5},
+        )
+        for resources in invalid_resources:
+            with self.subTest(snapshot_resources=resources):
+                history = UndoManager(
+                    self.workspace.capture,
+                    self.workspace.restore,
+                    snapshot_resources=lambda _snapshot, value=resources: value,
+                    max_stack_weight=8,
+                )
+                with self.assertRaises(ValueError):
+                    history.reset()
 
 
 if __name__ == "__main__":

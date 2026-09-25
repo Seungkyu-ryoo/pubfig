@@ -14,6 +14,7 @@ from dataclasses import asdict
 import json
 import os
 from pathlib import Path
+import stat
 from typing import Any
 from uuid import uuid4
 
@@ -33,12 +34,18 @@ from .plot_config import (
     PlotConfig,
     SeriesConfig,
     annotation_config_from_payload,
-    dataframe_from_payload as _dataframe_from_payload,
-    dataframe_to_payload as _dataframe_to_payload,
     plot_config_from_payload,
     series_config_from_payload,
 )
-from .sheet_data import blank_dataframe, normalize_dataframe_columns
+from .dataframe_codec import (
+    dataframe_from_payload as _dataframe_from_payload,
+    dataframe_to_payload as _dataframe_to_payload,
+)
+from .sheet_data import (
+    blank_dataframe,
+    normalize_column_names,
+    normalize_dataframe_columns,
+)
 
 
 PROJECT_SCHEMA_VERSION = 3
@@ -51,6 +58,13 @@ class ProjectFormatError(ValueError):
 
 class UnsupportedProjectVersion(ProjectFormatError):
     """The payload uses a schema version this build cannot read."""
+
+
+class ProjectConflictError(ProjectFormatError):
+    """The project pathname no longer names the generation that was opened."""
+
+
+ProjectRevision = tuple[int, int, int, int]
 
 
 def _mapping(value: Any, label: str) -> Mapping[str, Any]:
@@ -84,7 +98,12 @@ def project_schema_version(payload: Mapping[str, Any]) -> int:
 def dataframe_to_payload(df: pd.DataFrame) -> dict[str, Any]:
     """Encode a DataFrame after enforcing canonical unique columns."""
 
-    return _dataframe_to_payload(normalize_dataframe_columns(df))
+    # Only column identifiers require normalization while encoding.  Avoid a
+    # deep copy of every cell in an Excel-sized frame merely to rename its
+    # columns; the row codec is non-mutating.
+    payload = _dataframe_to_payload(df)
+    payload["columns"] = normalize_column_names(df.columns)
+    return payload
 
 
 def dataframe_from_payload(payload: Mapping[str, Any] | None) -> pd.DataFrame:
@@ -135,6 +154,10 @@ def tree_to_payload(node: TreeNode) -> dict[str, Any]:
 def document_to_payload(document: ProjectDocument) -> dict[str, Any]:
     """Encode a document in the current v3 JSON shape."""
 
+    # Sheet/graph names exist both on their canonical objects and their tree
+    # nodes.  External callers may update only the object; synchronize before
+    # writing so a subsequent load never looks like it undid that rename.
+    document.synchronize_tree_names()
     return {
         "schema_version": PROJECT_SCHEMA_VERSION,
         "active_node_id": document.active_node_id,
@@ -384,13 +407,84 @@ def load_payload_into_model(
     )
 
 
+def _revision_from_stat(value: os.stat_result) -> ProjectRevision:
+    return (
+        int(value.st_dev),
+        int(value.st_ino),
+        int(value.st_size),
+        int(value.st_mtime_ns),
+    )
+
+
+def project_path_revision(path: str | os.PathLike[str]) -> ProjectRevision:
+    """Return a token identifying the current generation of ``path``."""
+
+    project_path = Path(path)
+    try:
+        return _revision_from_stat(project_path.stat())
+    except OSError as exc:
+        raise ProjectConflictError(
+            f"Project file is unavailable or changed externally: {project_path}"
+        ) from exc
+
+
+def _expected_revision(value: object) -> ProjectRevision:
+    if (
+        not isinstance(value, (list, tuple))
+        or len(value) != 4
+        or any(type(part) is not int for part in value)
+    ):
+        raise TypeError("expected_revision must contain four integers")
+    return value[0], value[1], value[2], value[3]
+
+
+def _assert_project_revision(
+    path: Path,
+    expected_revision: ProjectRevision,
+    *,
+    phase: str,
+) -> None:
+    try:
+        current = project_path_revision(path)
+    except ProjectConflictError as exc:
+        raise ProjectConflictError(
+            f"Project changed externally {phase}: {path}"
+        ) from exc
+    if current != expected_revision:
+        raise ProjectConflictError(f"Project changed externally {phase}: {path}")
+
+
+def read_project_payload(
+    path: str | os.PathLike[str],
+) -> tuple[dict[str, Any], ProjectRevision]:
+    """Read one stable JSON generation and return its identity token."""
+
+    project_path = Path(path)
+    before = project_path_revision(project_path)
+    with project_path.open("r", encoding="utf-8") as file:
+        opened = _revision_from_stat(os.fstat(file.fileno()))
+        if opened != before:
+            raise ProjectConflictError(
+                f"Project changed externally while it was opened: {project_path}"
+            )
+        payload = json.load(file)
+        after_read = _revision_from_stat(os.fstat(file.fileno()))
+    if after_read != opened or project_path_revision(project_path) != opened:
+        raise ProjectConflictError(
+            f"Project changed externally while it was being read: {project_path}"
+        )
+    return dict(_mapping(payload, "project")), opened
+
+
 def read_project(path: str | os.PathLike[str]) -> ProjectDocument:
     """Read and decode a project file; the filename stem names v1 projects."""
 
     project_path = Path(path)
-    with project_path.open("r", encoding="utf-8") as file:
-        payload = json.load(file)
-    return document_from_payload(_mapping(payload, "project"), project_path.stem)
+    payload, revision = read_project_payload(project_path)
+    document = document_from_payload(payload, project_path.stem)
+    document.source_path = project_path.resolve()
+    document.source_revision = revision
+    return document
 
 
 def write_json_atomic(
@@ -398,6 +492,7 @@ def write_json_atomic(
     payload: Mapping[str, Any],
     *,
     indent: int | None = None,
+    expected_revision: ProjectRevision | None = None,
 ) -> Path:
     """Atomically replace ``path`` with UTF-8 JSON and return the path.
 
@@ -407,20 +502,63 @@ def write_json_atomic(
     """
 
     target = Path(path)
+    normalized_revision = (
+        None
+        if expected_revision is None
+        else _expected_revision(expected_revision)
+    )
+    if normalized_revision is not None:
+        _assert_project_revision(
+            target,
+            normalized_revision,
+            phase="before save",
+        )
     target.parent.mkdir(parents=True, exist_ok=True)
     temporary = target.with_name(f".{target.name}.{uuid4().hex}.tmp")
     try:
-        with temporary.open("x", encoding="utf-8") as file:
+        file_mode = stat.S_IMODE(target.stat().st_mode)
+    except FileNotFoundError:
+        file_mode = 0o600
+    try:
+        descriptor = os.open(
+            temporary,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            file_mode,
+        )
+        if hasattr(os, "fchmod"):
+            try:
+                os.fchmod(descriptor, file_mode)
+            except Exception:
+                os.close(descriptor)
+                raise
+        with os.fdopen(descriptor, "w", encoding="utf-8") as file:
+            separators = (",", ":") if indent is None else None
             json.dump(
                 payload,
                 file,
                 indent=indent,
+                separators=separators,
                 ensure_ascii=False,
                 allow_nan=False,
             )
             file.flush()
             os.fsync(file.fileno())
+        if normalized_revision is not None:
+            _assert_project_revision(
+                target,
+                normalized_revision,
+                phase="during save",
+            )
         temporary.replace(target)
+        try:
+            directory_descriptor = os.open(target.parent, os.O_RDONLY)
+        except OSError:
+            directory_descriptor = -1
+        if directory_descriptor >= 0:
+            try:
+                os.fsync(directory_descriptor)
+            finally:
+                os.close(directory_descriptor)
     finally:
         try:
             temporary.unlink(missing_ok=True)
@@ -433,14 +571,30 @@ def write_project(
     path: str | os.PathLike[str],
     document: ProjectDocument,
     *,
-    indent: int | None = 2,
+    indent: int | None = None,
 ) -> Path:
-    """Encode and atomically save a project, adding ``.json`` when needed."""
+    """Encode and atomically save a compact project, adding ``.json``."""
 
     target = Path(path)
     if target.suffix.lower() != ".json":
         target = target.with_suffix(".json")
-    return write_json_atomic(target, document_to_payload(document), indent=indent)
+    source_path = document.source_path
+    expected_revision = (
+        document.source_revision
+        if source_path is not None
+        and document.source_revision is not None
+        and source_path.resolve() == target.resolve()
+        else None
+    )
+    saved_path = write_json_atomic(
+        target,
+        document_to_payload(document),
+        indent=indent,
+        expected_revision=expected_revision,
+    )
+    document.source_path = saved_path.resolve()
+    document.source_revision = project_path_revision(saved_path)
+    return saved_path
 
 
 # Migration-friendly names used by the old window and by project builders.
@@ -454,7 +608,9 @@ _write_json_atomic = write_json_atomic
 
 __all__ = [
     "PROJECT_SCHEMA_VERSION",
+    "ProjectConflictError",
     "ProjectFormatError",
+    "ProjectRevision",
     "SUPPORTED_SCHEMA_VERSIONS",
     "UnsupportedProjectVersion",
     "dataframe_from_payload",
@@ -464,11 +620,13 @@ __all__ = [
     "graph_to_payload",
     "load_payload_into_model",
     "project_from_payload",
+    "project_path_revision",
     "project_payload",
     "project_schema_version",
     "project_to_payload",
     "read_document",
     "read_project",
+    "read_project_payload",
     "sheet_to_payload",
     "tree_from_payload",
     "tree_to_payload",

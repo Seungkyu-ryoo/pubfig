@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field, fields
-import math
 from typing import Any
 
 import pandas as pd
+
+from .dataframe_codec import dataframe_from_payload, dataframe_to_payload
 
 
 SCHEMA_VERSION = 1
@@ -123,7 +124,46 @@ PRESETS: dict[str, FigurePreset] = {
 
 
 PLOT_TYPES = ["line", "scatter", "line+marker", "bar", "step", "area", "stem"]
-MARKERS = ["o", "s", "^", "v", "D", "x", "+", "*", "."]
+# Human-readable marker names are kept beside their Matplotlib values so the
+# UI never has to expose implementation codes such as ``s`` or ``v``.  Keep
+# ``MARKERS`` as the public list of codes for compatibility with callers that
+# imported it before the labelled selector was introduced.
+MARKER_CHOICES = (
+    ("o", "Circle"),
+    ("s", "Square"),
+    ("^", "Triangle up"),
+    ("v", "Triangle down"),
+    ("<", "Triangle left"),
+    (">", "Triangle right"),
+    ("D", "Diamond"),
+    ("d", "Thin diamond"),
+    ("p", "Pentagon"),
+    ("h", "Hexagon"),
+    ("H", "Rotated hexagon"),
+    ("8", "Octagon"),
+    ("*", "Star"),
+    ("P", "Filled plus"),
+    ("X", "Filled X"),
+    (".", "Point"),
+    (r"$\odot$", "Bullseye"),
+    (r"$\oplus$", "Circled plus"),
+    ("+", "Plus"),
+    ("x", "X"),
+    (",", "Pixel"),
+    ("|", "Vertical line"),
+    ("_", "Horizontal line"),
+    ("1", "Tripod down"),
+    ("2", "Tripod up"),
+    ("3", "Tripod left"),
+    ("4", "Tripod right"),
+    ("None", "No marker"),
+)
+MARKERS = [code for code, _label in MARKER_CHOICES]
+MARKER_FILL_STYLES = ("full", "none", "left", "right", "bottom", "top")
+PARTIAL_MARKER_FILL_STYLES = ("left", "right", "bottom", "top")
+FILLABLE_MARKERS = frozenset(
+    {".", "o", "v", "^", "<", ">", "8", "s", "p", "*", "h", "H", "D", "d", "P", "X"}
+)
 # Line styles offered for data series (the four common publication choices).
 LINE_STYLES = ["solid", "dashed", "dotted", "dashdot"]
 ANNOTATION_LINE_STYLES = [
@@ -149,6 +189,7 @@ class SeriesConfig:
     plot_type: str = "line"
     y_axis: str = "left"
     marker: str = "o"
+    marker_fill_style: str = "full"
     line_style: str = "solid"
     line_width: float = 1.0
     marker_size: float = 4.0
@@ -158,6 +199,11 @@ class SeriesConfig:
     show_in_legend: bool = True
     error_column: str = ""
     error_cap_size: float = 2.0
+    linear_fit_enabled: bool = False
+    linear_fit_x_min: float | None = None
+    linear_fit_x_max: float | None = None
+    linear_fit_line_style: str = "dashed"
+    linear_fit_line_width: float = 1.0
 
 
 @dataclass
@@ -185,10 +231,39 @@ class LegendEntryConfig:
 
     ``source_y`` chooses the plotted series whose marker/line handle is used,
     while ``label`` is the independent text displayed beside that handle.
+    An empty ``source_y`` creates a text-only item (or a spacer when ``label``
+    is also empty).  Origin-style ``%(n)`` references in ``label`` are resolved
+    against the current plotted-series order when the legend is rendered.
+    The optional font fields style the entire label.  Empty font-family and
+    color values, and a ``None`` font size, inherit the legend defaults.
     """
 
     source_y: str = ""
     label: str = ""
+    font_family: str = ""
+    font_size: float | None = None
+    font_bold: bool = False
+    font_italic: bool = False
+    text_color: str = ""
+
+
+@dataclass
+class SeriesColorRecipe:
+    """Reproducible color mapping for every plotted series in a graph.
+
+    Final per-series colors remain stored in :class:`SeriesConfig`.  This
+    optional recipe records how those colors were generated so style copy can
+    resample the same colormap when the destination has a different number of
+    plotted series.
+    """
+
+    kind: str = "matplotlib_colormap"
+    name: str = "viridis"
+    start: float = 0.05
+    end: float = 0.95
+    scope: str = "all_plotted"
+    series_count: int = 0
+    sampling: str = "linear_endpoints_v1"
 
 
 @dataclass
@@ -207,7 +282,7 @@ class PlotConfig:
     tick_size: int = 6
     legend_size: int = 6
     x_label_offset_mm: float = 4.0
-    y_label_offset_mm: float = 10.0
+    y_label_offset_mm: float = 6.0
     x_tick_pad: float = 3.5
     y_tick_pad: float = 3.5
     y2_tick_pad: float = 3.5
@@ -234,6 +309,15 @@ class PlotConfig:
     x_tick_interval: float | None = None
     y_tick_interval: float | None = None
     y2_tick_interval: float | None = None
+    x_tick_decimals: int | None = None
+    y_tick_decimals: int | None = None
+    y2_tick_decimals: int | None = None
+    x_scientific_notation: bool = True
+    y_scientific_notation: bool = True
+    y2_scientific_notation: bool = True
+    x_tick_notation: str = "auto"
+    y_tick_notation: str = "auto"
+    y2_tick_notation: str = "auto"
     x_minor_divisions: int = 5
     y_minor_divisions: int = 5
     y2_minor_divisions: int = 5
@@ -273,6 +357,7 @@ class PlotConfig:
     pad_right_mm: float = 0.0
     pad_top_mm: float = 0.0
     pad_bottom_mm: float = 0.0
+    series_color_recipe: SeriesColorRecipe | None = None
     annotations: list[AnnotationConfig] | None = None
     trim_whitespace: bool = False
     transparent: bool = False
@@ -295,6 +380,20 @@ class PlotConfig:
                         )
                     )
             self.legend_entries = normalized_entries
+        if isinstance(self.series_color_recipe, dict):
+            known = _known_fields(SeriesColorRecipe)
+            self.series_color_recipe = SeriesColorRecipe(
+                **{
+                    key: value
+                    for key, value in self.series_color_recipe.items()
+                    if key in known
+                }
+            )
+        elif not isinstance(
+            self.series_color_recipe,
+            (SeriesColorRecipe, type(None)),
+        ):
+            self.series_color_recipe = None
         if self.plot_width_mm <= 0:
             self.plot_width_mm = max(self.width_mm - self.plot_margin_left_mm - self.plot_margin_right_mm, 1.0)
         if self.plot_height_mm <= 0:
@@ -314,6 +413,25 @@ def apply_preset(config: PlotConfig, preset_name: str) -> PlotConfig:
     config.tick_size = preset.tick_size
     config.legend_size = preset.legend_size
     return config
+
+
+TICK_NOTATIONS = {
+    "auto": "Auto",
+    "plain": "Plain numbers",
+    "scientific": "Scientific — each tick",
+    "shared": "Scientific — shared exponent",
+}
+
+
+def axis_tick_notation(config: PlotConfig, axis: str) -> str:
+    mode = getattr(config, f"{axis}_tick_notation")
+    if mode not in TICK_NOTATIONS:
+        mode = "auto"
+    # Honor projects saved with the earlier scientific-notation checkbox.
+    if (mode == "auto" and not getattr(config, f"{axis}_scientific_notation")
+            and getattr(config, f"{axis}_scale") == "linear"):
+        return "plain"
+    return mode
 
 
 def _known_fields(cls) -> set[str]:
@@ -343,25 +461,6 @@ def annotation_config_from_payload(payload: dict[str, Any]) -> AnnotationConfig:
 def legend_entry_config_from_payload(payload: dict[str, Any]) -> LegendEntryConfig:
     known = _known_fields(LegendEntryConfig)
     return LegendEntryConfig(**{key: value for key, value in payload.items() if key in known})
-
-
-def dataframe_to_payload(df: pd.DataFrame) -> dict[str, Any]:
-    rows: list[list[Any]] = []
-    for _, row in df.iterrows():
-        values: list[Any] = []
-        for value in row.tolist():
-            if pd.isna(value):
-                values.append(None)
-            elif isinstance(value, float) and not math.isfinite(value):
-                values.append(None)
-            else:
-                values.append(value)
-        rows.append(values)
-    return {"columns": list(map(str, df.columns)), "rows": rows}
-
-
-def dataframe_from_payload(payload: dict[str, Any]) -> pd.DataFrame:
-    return pd.DataFrame(payload.get("rows", []), columns=payload.get("columns", []))
 
 
 def project_to_payload(

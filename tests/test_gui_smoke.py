@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import Future
 import os
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -10,12 +11,19 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pandas as pd
 from pandas.testing import assert_frame_equal
+from matplotlib.backend_bases import MouseEvent
+from PIL import Image
 from PySide6.QtCore import QEvent, QModelIndex, QSettings, Qt
 from PySide6.QtGui import QKeyEvent, QKeySequence
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QMessageBox
 
 from app import GraphDrawerWindow, LegendEditorDialog
 from plot_config import AnnotationConfig, LegendEntryConfig
+from pubfig.sheet_data import NAME_ROW
+from pubfig.save_worker import SaveResult
+from pubfig.project_io import project_path_revision, write_json_atomic
+from pubfig.ui.main_window import MAX_UNDO_STACK_WEIGHT_BYTES
+from pubfig.workspace_history import project_snapshot_resources
 from table_view import TableSelectionRange
 from theme import apply_theme
 
@@ -61,8 +69,541 @@ class GraphDrawerWindowTests(unittest.TestCase):
         self.assertEqual(self.window.df.iat[2, 0], "1.25")
         self.assertGreaterEqual(self.window.undo_history.undo_count, 1)
 
+        # A manual save clears the dirty marker. Undoing after that save must
+        # mark the restored, different project state dirty again.
+        self.window._set_modified(False)
         self.window.undo_workspace()
+        self.assertTrue(self.window._is_modified)
         self.assertEqual(self.window.table.item(2, 0).text(), original)
+
+    def test_tick_decimal_edit_is_dirty_rendered_and_undoable(self) -> None:
+        self.window.new_graph()
+        self.window.undo_history.reset()
+        self.window._set_modified(False)
+        with patch.object(self.window.preview, "schedule_render") as schedule:
+            self.window.figure_settings.x_tick_decimals_spin.setValue(2)
+            schedule.assert_called_once()
+        self.assertTrue(self.window.session.modified)
+        self.assertEqual(self.window.session.plot_config.x_tick_decimals, 2)
+        self.window.undo_workspace()
+        self.assertIsNone(self.window.session.plot_config.x_tick_decimals)
+        self.assertEqual(self.window.figure_settings.x_tick_decimals_spin.text(), "Auto")
+        self.window.redo_workspace()
+        self.assertEqual(self.window.session.plot_config.x_tick_decimals, 2)
+        self.assertEqual(self.window.figure_settings.x_tick_decimals_spin.value(), 2)
+
+    def test_number_format_selection_renders_and_supports_undo(self) -> None:
+        self.window.new_graph()
+        self.window.undo_history.reset()
+        self.window._set_modified(False)
+        panel = self.window.figure_settings
+        with patch.object(self.window.preview, "schedule_render") as schedule:
+            panel.y_tick_notation_combo.setCurrentIndex(panel.y_tick_notation_combo.findData("shared"))
+            schedule.assert_called_once()
+        self.assertTrue(self.window.session.modified)
+        self.assertEqual(self.window.session.plot_config.y_tick_notation, "shared")
+        self.window.undo_workspace()
+        self.assertEqual(panel.y_tick_notation_combo.currentData(), "auto")
+        self.assertEqual(self.window.session.plot_config.y_tick_notation, "auto")
+        self.window.redo_workspace()
+        self.assertEqual(panel.y_tick_notation_combo.currentData(), "shared")
+        self.assertEqual(self.window.session.plot_config.y_tick_notation, "shared")
+        panel.y_scale_combo.setCurrentText("log")
+        self.assertTrue(panel.y_tick_notation_combo.isEnabled())
+        panel.y_scale_combo.setCurrentText("linear")
+        self.assertTrue(panel.y_tick_notation_combo.isEnabled())
+        self.assertEqual(panel.y_tick_notation_combo.currentData(), "shared")
+
+    def test_divisor_input_updates_plot_and_preserves_scale_during_incomplete_input(self) -> None:
+        self.window.new_graph()
+        self.window.handle_table_paste(2, 0, "0.001\t1000000\n0.002\t2000000")
+        self.window.undo_history.reset()
+        panel = self.window.figure_settings
+        panel.x_scale_divisor_edit.setText("0.001")
+        panel.y_scale_divisor_edit.setText("1e6")
+        self.window.render_plot()
+        axis = self.window.preview.current_figure.axes[0]
+        self.assertEqual(list(axis.lines[0].get_xdata()), [.001, .002])
+        self.assertEqual(list(axis.lines[0].get_ydata()), [1e6, 2e6])
+        panel.y_scale_divisor_edit.setText("1e")
+        self.window.render_plot()
+        axis = self.window.preview.current_figure.axes[0]
+        self.assertEqual(list(axis.lines[0].get_ydata()), [1e6, 2e6])
+        self.assertEqual(self.window.current_workspace_snapshot().graphs[
+            self.window.session.active_graph_id
+        ].plot_config.y_scale_divisor, 1e6)
+        self.window.undo_workspace()
+        self.assertEqual(self.window.session.plot_config.y_scale_divisor, 1)
+        self.window.redo_workspace()
+        self.assertEqual(self.window.session.plot_config.y_scale_divisor, 1e6)
+
+    def test_undo_history_uses_structurally_shared_dataframe_budget(self) -> None:
+        with patch.object(
+            pd.DataFrame,
+            "memory_usage",
+            side_effect=AssertionError("undo must not deep-scan DataFrames"),
+        ):
+            snapshot = self.window.current_workspace_snapshot()
+            metadata_weight = self.window.workspace_snapshot_weight(snapshot)
+
+        self.assertEqual(
+            self.window.undo_history.max_stack_weight,
+            MAX_UNDO_STACK_WEIGHT_BYTES,
+        )
+        self.assertGreater(metadata_weight, 0)
+        self.assertLess(metadata_weight, MAX_UNDO_STACK_WEIGHT_BYTES)
+        self.assertEqual(
+            project_snapshot_resources(snapshot),
+            project_snapshot_resources(self.window.document),
+        )
+        for sheet_id, sheet in snapshot.sheets.items():
+            self.assertIsNot(sheet.df, self.window.sheets[sheet_id].df)
+
+    def test_plot_y_all_and_none_buttons_toggle_available_series(self) -> None:
+        self.window.table.item(0, 2).setText("Y")
+        self.window.new_graph()
+
+        self.assertEqual(self.window.plot_y_all_btn.text(), "All")
+        self.assertEqual(self.window.plot_y_none_btn.text(), "None")
+        self.assertEqual(self.window.checked_y_columns(), ["Col 2", "Col 3"])
+
+        self.window._set_modified(False)
+        with patch.object(self.window.preview, "schedule_render") as schedule_render:
+            self.window.plot_y_none_btn.click()
+
+            self.assertEqual(self.window.checked_y_columns(), [])
+            self.assertEqual(self.window.selected_series_configs(), [])
+            self.assertEqual(schedule_render.call_count, 1)
+            self.assertTrue(self.window._is_modified)
+
+            self.window.plot_y_none_btn.click()
+            self.assertEqual(schedule_render.call_count, 1)
+
+            self.window.plot_y_all_btn.click()
+
+            self.assertEqual(self.window.checked_y_columns(), ["Col 2", "Col 3"])
+            self.assertEqual(
+                [series.y for series in self.window.selected_series_configs()],
+                ["Col 2", "Col 3"],
+            )
+            self.assertEqual(schedule_render.call_count, 2)
+
+    def test_plot_y_selection_is_dirty_and_undoable(self) -> None:
+        self.window.table.item(0, 2).setText("Y")
+        self.window.new_graph()
+        expected = ["Col 2", "Col 3"]
+        self.assertEqual(self.window.checked_y_columns(), expected)
+
+        self.window._set_modified(False)
+        self.window.plot_y_none_btn.click()
+
+        self.assertTrue(self.window._is_modified)
+        self.assertEqual(self.window.checked_y_columns(), [])
+        self.assertEqual(self.window.capture_active_graph().checked_y, [])
+
+        self.window.undo_workspace()
+
+        self.assertEqual(self.window.checked_y_columns(), expected)
+        self.assertEqual(self.window.capture_active_graph().checked_y, expected)
+
+    def test_marker_grid_choice_is_dirty_and_undoable(self) -> None:
+        self.window.new_graph()
+        target = self.window.style_target_combo.currentText()
+        self.assertTrue(target)
+        original = self.window.series_by_y[target]
+        original_choice = (original.marker, original.marker_fill_style)
+        self.window.undo_history.reset()
+        self.window._set_modified(False)
+
+        self.window.marker_combo.set_choice("o", "left")
+
+        changed = self.window.series_by_y[target]
+        self.assertEqual((changed.marker, changed.marker_fill_style), ("o", "left"))
+        self.assertTrue(self.window._is_modified)
+        self.assertEqual(self.window.undo_history.undo_count, 1)
+
+        self.window.undo_workspace()
+        restored = self.window.series_by_y[target]
+        self.assertEqual((restored.marker, restored.marker_fill_style), original_choice)
+
+
+    def test_autosave_is_submitted_to_background_writer_and_reported_on_qt_thread(self) -> None:
+        future = Future()
+        self.window._set_modified(True)
+
+        with patch.object(
+            self.window.save_writer,
+            "submit_document",
+            return_value=future,
+        ) as submit:
+            self.window.autosave_project()
+
+        submit.assert_called_once_with(
+            self.window.autosave_path,
+            self.window.document,
+            indent=None,
+            autosave=True,
+            extra_payload={"autosave_origin": ""},
+        )
+        self.assertIn(future, self.window._autosave_futures)
+        self.assertIn("background", self.window.statusBar().currentMessage())
+
+        future.set_result(
+            SaveResult(path=self.window.autosave_path, autosave=True)
+        )
+        self.app.processEvents()
+
+        self.assertNotIn(future, self.window._autosave_futures)
+        self.assertIn("Autosaved in background", self.window.statusBar().currentMessage())
+
+    def test_discarded_running_autosave_cannot_reappear_after_cleanup(self) -> None:
+        running = Future()
+        self.window._autosave_futures.add(running)
+
+        with patch.object(
+            self.window.save_writer,
+            "discard_autosave",
+            return_value=Future(),
+        ):
+            self.window._discard_autosave_in_background()
+
+        # Simulate the already-running atomic writer replacing the path after
+        # the immediate unlink and after its queued removal was cancelled.
+        self.window.autosave_path.write_bytes(b"late autosave")
+        running.set_result(
+            SaveResult(path=self.window.autosave_path, autosave=True)
+        )
+        self.assertFalse(self.window.autosave_path.exists())
+
+    def test_default_autosave_path_is_unique_per_window_session(self) -> None:
+        other = None
+        original_restore = GraphDrawerWindow.maybe_restore_autosave
+        GraphDrawerWindow.maybe_restore_autosave = lambda _window: None
+        try:
+            other = GraphDrawerWindow()
+        finally:
+            GraphDrawerWindow.maybe_restore_autosave = original_restore
+        try:
+            other.autosave_timer.stop()
+            first = self.window._default_autosave_path
+            second = other._default_autosave_path
+            self.assertNotEqual(first, second)
+            self.assertRegex(
+                first.name,
+                rf"^\.pubfig_autosave\.{os.getpid()}\.[0-9a-f]{{32}}\.json$",
+            )
+            self.assertRegex(
+                second.name,
+                rf"^\.pubfig_autosave\.{os.getpid()}\.[0-9a-f]{{32}}\.json$",
+            )
+        finally:
+            if other is not None:
+                other._set_modified(False)
+                other.close()
+                self.app.processEvents()
+
+    def test_cleanup_removes_only_owned_and_accepted_recovery_paths(self) -> None:
+        owned = self.window.autosave_path
+        accepted = Path(self.temp_directory.name) / (
+            ".pubfig_autosave.900001.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.json"
+        )
+        unrelated = Path(self.temp_directory.name) / (
+            ".pubfig_autosave.900002.bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.json"
+        )
+        for path in (owned, accepted, unrelated):
+            path.write_bytes(b"recovery")
+        self.window._recovery_source_path = accepted
+
+        self.window._remove_autosave()
+
+        self.assertFalse(owned.exists())
+        self.assertFalse(accepted.exists())
+        self.assertTrue(unrelated.exists())
+
+    def test_recovery_scan_skips_files_owned_by_live_processes(self) -> None:
+        directory = Path(self.temp_directory.name)
+        own = directory / (
+            f".pubfig_autosave.{os.getpid()}.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.json"
+        )
+        stale = directory / (
+            ".pubfig_autosave.900003.bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.json"
+        )
+        self.window.autosave_path = own
+        self.window._default_autosave_path = own
+        self.window.legacy_autosave_path = directory / ".pubfig_autosave.json"
+        own.write_bytes(b"live")
+        stale.write_bytes(b"stale")
+
+        with (
+            patch.object(
+                self.window,
+                "_process_is_running",
+                side_effect=lambda pid: pid == os.getpid(),
+            ),
+            patch(
+                "PySide6.QtWidgets.QMessageBox.question",
+                return_value=QMessageBox.No,
+            ),
+        ):
+            self.window.maybe_restore_autosave()
+
+        self.assertTrue(own.exists())
+        self.assertFalse(stale.exists())
+
+    def test_legacy_fixed_autosave_is_still_discovered(self) -> None:
+        legacy = Path(self.temp_directory.name) / ".pubfig_autosave.json"
+        self.window.legacy_autosave_path = legacy
+        legacy.write_bytes(b"legacy recovery")
+
+        with patch(
+            "PySide6.QtWidgets.QMessageBox.question",
+            return_value=QMessageBox.No,
+        ):
+            self.window.maybe_restore_autosave()
+
+        self.assertFalse(legacy.exists())
+
+    def test_corrupt_autosave_is_preserved_after_failed_recovery(self) -> None:
+        self.window.autosave_path.write_bytes(b"damaged recovery")
+
+        with (
+            patch(
+                "PySide6.QtWidgets.QMessageBox.question",
+                return_value=QMessageBox.Yes,
+            ),
+            patch("PySide6.QtWidgets.QMessageBox.warning") as warning,
+        ):
+            self.window.maybe_restore_autosave()
+
+        warning.assert_called_once()
+        self.assertEqual(
+            self.window.autosave_path.read_bytes(),
+            b"damaged recovery",
+        )
+        self.assertIn("file kept", self.window.statusBar().currentMessage())
+
+    def test_changed_recovery_origin_forces_save_as(self) -> None:
+        directory = Path(self.temp_directory.name)
+        origin = directory / "origin.json"
+        write_json_atomic(origin, self.window.project_payload())
+        original_revision = project_path_revision(origin)
+        recovery_payload = self.window.project_payload()
+        recovery_payload.update(
+            {
+                "autosave_origin": str(origin.resolve()),
+                "autosave_origin_revision": list(original_revision),
+            }
+        )
+        write_json_atomic(self.window.autosave_path, recovery_payload)
+        write_json_atomic(origin, {**self.window.project_payload(), "external": True})
+        external_bytes = origin.read_bytes()
+
+        with (
+            patch(
+                "PySide6.QtWidgets.QMessageBox.question",
+                return_value=QMessageBox.Yes,
+            ),
+            patch.object(self.window.preview, "render_plot"),
+        ):
+            self.window.maybe_restore_autosave()
+
+        self.assertIsNone(self.window.current_project_path)
+        self.assertIn("Save As is required", self.window.statusBar().currentMessage())
+        self.assertEqual(
+            self.window._autosave_origin_metadata(),
+            {
+                "autosave_origin": str(origin.resolve()),
+                "autosave_origin_revision": list(original_revision),
+            },
+        )
+        with patch.object(
+            self.window.files,
+            "_choose_project_save_path",
+            return_value=None,
+        ) as choose:
+            self.window.save_project()
+        choose.assert_called_once_with()
+        self.assertEqual(origin.read_bytes(), external_bytes)
+
+    def test_recovery_origin_without_revision_forces_save_as(self) -> None:
+        directory = Path(self.temp_directory.name)
+        origin = directory / "origin.json"
+        write_json_atomic(origin, self.window.project_payload())
+        recovery_payload = self.window.project_payload()
+        recovery_payload["autosave_origin"] = str(origin.resolve())
+        write_json_atomic(self.window.autosave_path, recovery_payload)
+
+        with (
+            patch(
+                "PySide6.QtWidgets.QMessageBox.question",
+                return_value=QMessageBox.Yes,
+            ),
+            patch.object(self.window.preview, "render_plot"),
+        ):
+            self.window.maybe_restore_autosave()
+
+        self.assertIsNone(self.window.current_project_path)
+        self.assertIsNone(self.window._current_project_revision)
+        self.assertIn("Save As is required", self.window.statusBar().currentMessage())
+
+    def test_recovery_file_cannot_be_trusted_as_its_own_origin(self) -> None:
+        directory = Path(self.temp_directory.name)
+        fake_origin = directory / (
+            ".pubfig_autosave.900004.cccccccccccccccccccccccccccccccc.json"
+        )
+        write_json_atomic(fake_origin, self.window.project_payload())
+        recovery_payload = self.window.project_payload()
+        recovery_payload.update(
+            {
+                "autosave_origin": str(fake_origin.resolve()),
+                "autosave_origin_revision": list(
+                    project_path_revision(fake_origin)
+                ),
+            }
+        )
+        write_json_atomic(self.window.autosave_path, recovery_payload)
+
+        with (
+            patch(
+                "PySide6.QtWidgets.QMessageBox.question",
+                return_value=QMessageBox.Yes,
+            ),
+            patch.object(self.window.preview, "render_plot"),
+        ):
+            self.window.maybe_restore_autosave()
+
+        self.assertIsNone(self.window.current_project_path)
+        self.assertIn("Save As is required", self.window.statusBar().currentMessage())
+
+    def test_origin_changed_after_recovery_is_rejected_by_manual_save_cas(self) -> None:
+        directory = Path(self.temp_directory.name)
+        origin = directory / "origin.json"
+        write_json_atomic(origin, self.window.project_payload())
+        original_revision = project_path_revision(origin)
+        recovery_payload = self.window.project_payload()
+        recovery_payload.update(
+            {
+                "autosave_origin": str(origin.resolve()),
+                "autosave_origin_revision": list(original_revision),
+            }
+        )
+        write_json_atomic(self.window.autosave_path, recovery_payload)
+        with (
+            patch(
+                "PySide6.QtWidgets.QMessageBox.question",
+                return_value=QMessageBox.Yes,
+            ),
+            patch.object(self.window.preview, "render_plot"),
+        ):
+            self.window.maybe_restore_autosave()
+        self.assertEqual(self.window.current_project_path, origin.resolve())
+
+        write_json_atomic(origin, {**self.window.project_payload(), "external": True})
+        external_bytes = origin.read_bytes()
+        with patch("PySide6.QtWidgets.QMessageBox.warning") as warning:
+            self.assertFalse(self.window._save_project_to(origin))
+
+        warning.assert_called_once()
+        self.assertEqual(origin.read_bytes(), external_bytes)
+        self.assertTrue(self.window.autosave_path.exists())
+
+    def test_reserved_recovery_path_cannot_be_opened_or_manually_saved(self) -> None:
+        recovery = self.window.autosave_path
+        write_json_atomic(recovery, self.window.project_payload())
+        recovery_bytes = recovery.read_bytes()
+        self.window._set_modified(True)
+
+        with (
+            patch("pubfig.ui.project_files.read_project_document") as read,
+            patch("PySide6.QtWidgets.QMessageBox.warning") as warning,
+        ):
+            self.window.open_project_path(recovery)
+            saved = self.window._save_project_to(recovery)
+
+        read.assert_not_called()
+        self.assertFalse(saved)
+        self.assertEqual(warning.call_count, 2)
+        self.assertEqual(recovery.read_bytes(), recovery_bytes)
+        self.assertTrue(self.window._is_modified)
+
+    def test_dirty_open_cancel_does_not_read_the_candidate(self) -> None:
+        candidate = Path(self.temp_directory.name) / "candidate.json"
+        self.window._set_modified(True)
+
+        with (
+            patch(
+                "PySide6.QtWidgets.QMessageBox.question",
+                return_value=QMessageBox.Cancel,
+            ),
+            patch("pubfig.ui.project_files.read_project_document") as read,
+        ):
+            self.window.open_project_path(candidate)
+
+        read.assert_not_called()
+        self.assertTrue(self.window._is_modified)
+
+    def test_dirty_open_save_that_does_not_complete_aborts_open(self) -> None:
+        candidate = Path(self.temp_directory.name) / "candidate.json"
+        self.window._set_modified(True)
+
+        with (
+            patch(
+                "PySide6.QtWidgets.QMessageBox.question",
+                return_value=QMessageBox.Save,
+            ),
+            patch.object(self.window.files, "save_project") as save,
+            patch("pubfig.ui.project_files.read_project_document") as read,
+        ):
+            self.window.open_project_path(candidate)
+
+        save.assert_called_once_with()
+        read.assert_not_called()
+        self.assertTrue(self.window._is_modified)
+
+    def test_dirty_open_discard_loads_the_candidate(self) -> None:
+        candidate = Path(self.temp_directory.name) / "candidate.json"
+        write_json_atomic(candidate, self.window.project_payload())
+        self.window._set_modified(True)
+
+        with (
+            patch(
+                "PySide6.QtWidgets.QMessageBox.question",
+                return_value=QMessageBox.Discard,
+            ),
+            patch.object(self.window.preview, "render_plot"),
+        ):
+            self.window.open_project_path(candidate)
+
+        self.assertEqual(self.window.current_project_path, candidate.resolve())
+        self.assertEqual(
+            self.window._current_project_revision,
+            project_path_revision(candidate),
+        )
+        self.assertFalse(self.window._is_modified)
+
+    def test_display_request_uses_preview_cache_and_cell_edit_invalidates_it(self) -> None:
+        self.window.new_graph()
+
+        preview = self.window._render_request(preview=True)
+        full = self.window._render_request()
+
+        self.assertTrue(preview.render_options.preview)
+        self.assertIs(
+            preview.render_options.numeric_cache,
+            self.window.preview_numeric_cache,
+        )
+        self.assertFalse(full.render_options.preview)
+
+        self.window.preview_numeric_cache.bind(
+            preview.dataframe,
+            source=self.window.df,
+        ).numeric("Col 1")
+        self.assertTrue(self.window.preview_numeric_cache._numeric)
+
+        self.window.table.item(2, 0).setText("42")
+        self.app.processEvents()
+
+        self.assertFalse(self.window.preview_numeric_cache._numeric)
 
     def test_paste_preserves_current_cell_and_role_decorated_header(self) -> None:
         self.window.new_graph()
@@ -83,6 +624,16 @@ class GraphDrawerWindowTests(unittest.TestCase):
             "Col 1 (X)",
         )
         self.assertEqual(self.window.table.horizontalHeaderItem(0).text(), "Col 1")
+
+    def test_paste_into_name_row_keeps_a_spaced_name_in_one_cell(self) -> None:
+        self.window.new_graph()
+
+        self.window.handle_table_paste(NAME_ROW, 0, "1st cycle")
+
+        self.assertEqual(self.window.table.item(NAME_ROW, 0).text(), "1st cycle")
+        self.assertEqual(self.window.table.item(NAME_ROW, 1).text(), "")
+        self.assertEqual(self.window.df.iat[NAME_ROW, 0], "1st cycle")
+        self.assertEqual(self.window.df.iat[NAME_ROW, 1], "")
 
     def test_expanding_paste_preserves_next_paste_start_cell(self) -> None:
         self.window.new_graph()
@@ -341,6 +892,54 @@ class GraphDrawerWindowTests(unittest.TestCase):
         finally:
             dialog.close()
 
+    def test_manual_legend_is_authoritative_without_mutating_auto_visibility(self) -> None:
+        self.window.table.item(0, 2).setText("Y")
+        self.window.new_graph()
+        self.window._set_checked_y_columns(["Col 2", "Col 3"])
+        self.window.refresh_series_configs()
+        self.window.series_by_y["Col 2"].show_in_legend = True
+        self.window.series_by_y["Col 3"].show_in_legend = False
+        self.window.plot_config.legend_entries = [
+            LegendEntryConfig(label="Manual heading")
+        ]
+        series_configs = self.window.selected_series_configs()
+        candidates = self.window.legend_editor_candidates(series_configs)
+
+        self.assertEqual(
+            self.window.legend_editor_entries(candidates),
+            [LegendEntryConfig(label="Manual heading")],
+        )
+        changed = self.window.apply_legend_entry_config(
+            [
+                LegendEntryConfig(
+                    label="Manual heading",
+                    font_size=11.0,
+                    font_bold=True,
+                    text_color="#123456",
+                ),
+                LegendEntryConfig(source_y="Col 3", label="Control"),
+            ],
+            [2],
+            series_configs,
+        )
+
+        self.assertTrue(changed)
+        self.assertTrue(self.window.series_by_y["Col 2"].show_in_legend)
+        self.assertFalse(self.window.series_by_y["Col 3"].show_in_legend)
+        self.assertEqual(
+            self.window.plot_config.legend_entries,
+            [
+                LegendEntryConfig(
+                    label="Manual heading",
+                    font_size=11.0,
+                    font_bold=True,
+                    text_color="#123456",
+                ),
+                LegendEntryConfig(source_y="Col 3", label="Control"),
+            ],
+        )
+        self.assertEqual(self.window.plot_config.legend_row_lengths, [2])
+
     def test_shared_sheet_column_rename_and_delete_update_every_graph(self) -> None:
         self.window.table.item(0, 2).setText("Y")
         self.window.new_graph()
@@ -348,6 +947,7 @@ class GraphDrawerWindowTests(unittest.TestCase):
         sheet_id = self.window.active_sheet_id
         self.window._set_checked_y_columns(["Col 2"])
         self.window.plot_config.legend_entries = [
+            LegendEntryConfig(label="Measurements"),
             LegendEntryConfig(source_y="Col 2", label="First graph"),
         ]
         self.window.save_active_state()
@@ -357,6 +957,7 @@ class GraphDrawerWindowTests(unittest.TestCase):
         self.assertNotEqual(first_graph_id, second_graph_id)
         self.window._set_checked_y_columns(["Col 2"])
         self.window.plot_config.legend_entries = [
+            LegendEntryConfig(label="Measurements"),
             LegendEntryConfig(source_y="Col 2", label="Second graph"),
         ]
         self.window.save_active_state()
@@ -373,7 +974,7 @@ class GraphDrawerWindowTests(unittest.TestCase):
         self.assertNotIn("Col 2", self.window.series_by_y)
         self.assertEqual(
             [entry.source_y for entry in self.window.plot_config.legend_entries],
-            ["Renamed Y"],
+            ["", "Renamed Y"],
         )
         for graph_id in (first_graph_id, second_graph_id):
             graph = self.window.graphs[graph_id]
@@ -382,7 +983,7 @@ class GraphDrawerWindowTests(unittest.TestCase):
             self.assertNotIn("Col 2", graph.series_by_y)
             self.assertEqual(
                 [entry.source_y for entry in graph.plot_config.legend_entries],
-                ["Renamed Y"],
+                ["", "Renamed Y"],
             )
         self.assertIn("Renamed Y", self.window.sheets[sheet_id].df.columns)
         self.assertNotIn("Col 2", self.window.sheets[sheet_id].df.columns)
@@ -394,15 +995,21 @@ class GraphDrawerWindowTests(unittest.TestCase):
 
         self.assertEqual(self.window.checked_y_columns(), [])
         self.assertNotIn("Renamed Y", self.window.series_by_y)
-        self.assertEqual(self.window.plot_config.legend_entries, [])
+        self.assertEqual(
+            self.window.plot_config.legend_entries,
+            [LegendEntryConfig(label="Measurements")],
+        )
         for graph_id in (first_graph_id, second_graph_id):
             graph = self.window.graphs[graph_id]
             self.assertEqual(graph.checked_y, [])
             self.assertNotIn("Renamed Y", graph.series_by_y)
-            self.assertEqual(graph.plot_config.legend_entries, [])
+            self.assertEqual(
+                graph.plot_config.legend_entries,
+                [LegendEntryConfig(label="Measurements")],
+            )
         self.assertNotIn("Renamed Y", self.window.sheets[sheet_id].df.columns)
 
-    def test_legend_editor_preserves_position_row_boundaries_on_delete_and_move(
+    def test_legend_editor_uses_text_order_and_tabs_for_row_boundaries(
         self,
     ) -> None:
         candidates = [
@@ -416,7 +1023,7 @@ class GraphDrawerWindowTests(unittest.TestCase):
             for source in ("A", "B", "C", "D")
         ]
 
-        delete_dialog = LegendEditorDialog(
+        dialog = LegendEditorDialog(
             candidates,
             entries,
             [2, 2],
@@ -424,37 +1031,22 @@ class GraphDrawerWindowTests(unittest.TestCase):
             parent=self.window,
         )
         try:
-            delete_dialog.table.selectRow(2)
-            delete_dialog.remove_selected_entry()
-            deleted_entries, deleted_row_lengths = delete_dialog.result_config()
+            dialog.text_edit.setPlainText(
+                "\\L(4) Fourth\t\\L(1) First\nHeading\n\\L(3) Third"
+            )
+            edited_entries, edited_row_lengths = dialog.result_config()
 
             self.assertEqual(
-                [entry.source_y for entry in deleted_entries],
-                ["A", "B", "D"],
+                [entry.source_y for entry in edited_entries],
+                ["D", "A", "", "C"],
             )
-            self.assertEqual(deleted_row_lengths, [2, 1])
-        finally:
-            delete_dialog.close()
-
-        move_dialog = LegendEditorDialog(
-            candidates,
-            entries,
-            [2, 2],
-            automatic=False,
-            parent=self.window,
-        )
-        try:
-            move_dialog.table.selectRow(0)
-            move_dialog.move_selected_entry(1)
-            moved_entries, moved_row_lengths = move_dialog.result_config()
-
             self.assertEqual(
-                [entry.source_y for entry in moved_entries],
-                ["B", "A", "C", "D"],
+                [entry.label for entry in edited_entries],
+                ["Fourth", "First", "Heading", "Third"],
             )
-            self.assertEqual(moved_row_lengths, [2, 2])
+            self.assertEqual(edited_row_lengths, [2, 1, 1])
         finally:
-            move_dialog.close()
+            dialog.close()
 
     def test_controls_follow_selected_project_context(self) -> None:
         self.assertIsNone(self.window.active_graph_id)
@@ -552,26 +1144,68 @@ class GraphDrawerWindowTests(unittest.TestCase):
     def test_loading_graph_renders_once_without_queued_duplicate(self) -> None:
         self.window.new_graph()
         calls = 0
-        original_render = self.window.render_plot
+        original_render = self.window.preview.render_plot
 
         def counted_render() -> None:
             nonlocal calls
             calls += 1
             original_render()
 
-        self.window.render_plot = counted_render
+        self.window.preview.render_plot = counted_render
         node = self.window.active_node()
         self.window.load_node(node)
 
         self.assertEqual(calls, 1)
         self.assertFalse(self.window.render_timer.isActive())
 
+    def test_switching_to_another_sheet_keeps_the_previous_graph_state(self) -> None:
+        self.window.new_graph()
+        graph_id = self.window.active_graph_id
+        graph_node_id = self.window.active_node_id
+        self.window.title_edit.setText("Original graph")
+        self.window.annotations.append(AnnotationConfig(text="Keep annotation"))
+        self.window.save_active_state()
+        original = self.window.graphs[graph_id]
+        original_series = set(original.series_by_y)
+
+        self.window.project_tree.new_sheet()
+        self.window.table.item(0, 1).setText("")
+        self.window.table.item(2, 0).setText("Other sheet data")
+
+        self.assertEqual(original.plot_config.title, "Original graph")
+        self.assertEqual(set(original.series_by_y), original_series)
+        self.assertEqual(original.annotations[0].text, "Keep annotation")
+        self.window.project_tree._select_node(graph_node_id)
+        self.assertIs(self.window.session.graph, original)
+        self.assertIs(self.window.plot_config, original.plot_config)
+        self.assertIs(self.window.annotations, original.annotations)
+        self.assertIs(self.window.series_by_y, original.series_by_y)
+        self.assertIs(self.window.df, self.window.session.sheet.df)
+        self.assertIs(self.window.table.dataframe(), self.window.session.sheet.df)
+
+    def test_undo_restores_canonical_graph_annotations_and_config_together(self) -> None:
+        self.window.new_graph()
+        self.window.annotations.append(AnnotationConfig(text="Before"))
+        self.window.undo_history.reset()
+        self.window.push_current_undo_state()
+        self.window.annotations = [AnnotationConfig(text="After")]
+        self.window.update_undo_baseline()
+
+        self.window.workspace.undo_workspace()
+        graph = self.window.session.graph
+        self.assertEqual(graph.annotations[0].text, "Before")
+        self.assertIs(self.window.annotations, graph.plot_config.annotations)
+        self.window.workspace.redo_workspace()
+        graph = self.window.session.graph
+        self.assertEqual(graph.annotations[0].text, "After")
+        self.assertIs(self.window.annotations, graph.annotations)
+
     def test_loading_flag_is_restored_when_graph_loading_fails(self) -> None:
         self.window.new_graph()
         node = self.window.active_node()
 
         with patch.object(
-            self.window,
+            self.window.workspace,
             "load_graph",
             side_effect=RuntimeError("invalid graph state"),
         ):
@@ -584,7 +1218,7 @@ class GraphDrawerWindowTests(unittest.TestCase):
         self.window.new_graph()
         self.window.undo_history.reset()
 
-        with patch.object(self.window, "schedule_render") as schedule_render:
+        with patch.object(self.window.preview, "schedule_render") as schedule_render:
             self.window.preset_combo.setCurrentText("ACS 1-col")
             self.assertEqual(schedule_render.call_count, 1)
             self.window.title_edit.setText("Title after preset")
@@ -659,6 +1293,44 @@ class GraphDrawerWindowTests(unittest.TestCase):
             ),
             (60.0, 30.0),
         )
+
+    def test_large_plot_width_survives_fit_and_png_export(self) -> None:
+        self.window.handle_table_paste(2, 0, "0\t1\n1\t2\n2\t0")
+        self.window.new_graph()
+        panel = self.window.figure_settings
+        panel.dpi_spin.setValue(100)
+        panel.plot_height_spin.setValue(50)
+        panel.fixed_plot_area_check.setChecked(True)
+        panel.plot_ratio_lock_check.setChecked(False)
+
+        for trim in (False, True):
+            with self.subTest(trim=trim):
+                self.window.trim_check.setChecked(trim)
+                sizes = []
+                for width in (400, 600):
+                    panel.plot_width_spin.setValue(width)
+                    panel.fit_canvas_btn.click()
+                    self.assertEqual(panel.plot_width_spin.value(), width)
+                    self.assertGreater(panel.width_spin.value(), width)
+                    path = Path(self.temp_directory.name) / f"{width}_{trim}.png"
+                    with patch(
+                        "pubfig.ui.preview_controller.QFileDialog.getSaveFileName",
+                        return_value=(str(path), "PNG (*.png)"),
+                    ):
+                        self.window.preview.export_current_figure()
+                    with Image.open(path) as image:
+                        sizes.append(image.size)
+                        self.assertAlmostEqual(image.info["dpi"][0], 100, places=2)
+                        if not trim:
+                            self.assertAlmostEqual(
+                                image.width, panel.width_spin.value() / 25.4 * 100,
+                                delta=1,
+                            )
+                # Check saved pixels, independently of any preview/viewer zoom.
+                self.assertAlmostEqual(
+                    sizes[1][0] - sizes[0][0], 200 / 25.4 * 100, delta=2,
+                )
+                self.assertEqual(sizes[1][1], sizes[0][1])
 
     def test_ratio_update_preserves_an_existing_signal_block(self) -> None:
         self.window.plot_height_spin.blockSignals(True)
@@ -740,6 +1412,17 @@ class GraphDrawerWindowTests(unittest.TestCase):
         self.assertIsNone(self.window.current_figure)
         self.assertEqual(figure.axes, [])
 
+    def test_close_unregisters_application_event_filter_once(self) -> None:
+        self.assertTrue(self.window._application_event_filter_installed)
+        self.window._set_modified(False)
+
+        self.window.close()
+
+        self.assertFalse(self.window._application_event_filter_installed)
+        # A second close must remain a harmless no-op for the global filter.
+        self.window.close()
+        self.assertFalse(self.window._application_event_filter_installed)
+
     def test_preview_dpi_accounts_for_retina_pixel_ratio(self) -> None:
         self.window.new_graph()
         self.window.render_plot()
@@ -776,8 +1459,62 @@ class GraphDrawerWindowTests(unittest.TestCase):
         self.window.render_plot()
         self.assertGreater(len(self.window.annotation_handle_artists), 0)
 
+    def test_annotation_can_be_dragged_before_data_is_plottable(self) -> None:
+        self.window.new_graph()
+        annotation = AnnotationConfig(
+            kind="text",
+            text="drag me",
+            x=0.4,
+            y=0.4,
+            width=0.15,
+            height=0.15,
+        )
+        self.window.annotations = [annotation]
+        self.window.plot_config.annotations = self.window.annotations
+        self.window.refresh_annotation_list()
+        self.window.annotation_list.setCurrentRow(0)
+        self.window.render_plot()
+        self.window.canvas.draw()
+
+        self.assertEqual(len(self.window.annotation_artists), 1)
+        axis = self.window.annotation_axes()
+        start_x, start_y = axis.transAxes.transform((0.4, 0.4))
+        end_x, end_y = axis.transAxes.transform((0.55, 0.55))
+        press = MouseEvent(
+            "button_press_event",
+            self.window.canvas,
+            start_x,
+            start_y,
+            button=1,
+        )
+        motion = MouseEvent(
+            "motion_notify_event",
+            self.window.canvas,
+            end_x,
+            end_y,
+            button=1,
+        )
+        release = MouseEvent(
+            "button_release_event",
+            self.window.canvas,
+            end_x,
+            end_y,
+            button=1,
+        )
+
+        self.window.canvas.callbacks.process("button_press_event", press)
+        self.assertEqual(self.window.drag_annotation_index, 0)
+        self.window.canvas.callbacks.process("motion_notify_event", motion)
+        self.window.canvas.callbacks.process("button_release_event", release)
+
+        self.assertAlmostEqual(annotation.x, 0.55, delta=0.01)
+        self.assertAlmostEqual(annotation.y, 0.55, delta=0.01)
+        self.assertIsNone(self.window.drag_annotation_index)
+
     def test_named_style_persists_and_applies_in_another_window(self) -> None:
         self.window.new_graph()
+        self.window.title_edit.setText("Copied title")
+        self.window.title_size_spin.setValue(17)
         self.window.axis_size_spin.setValue(11)
         self.window.line_width_spin.setValue(2.75)
         self.window.annotations = [
@@ -802,13 +1539,15 @@ class GraphDrawerWindowTests(unittest.TestCase):
             other.refresh_saved_style_combo()
             other.new_graph()
             other.title_edit.setText("Keep this title")
+            other.title_size_spin.setValue(6)
             other.axis_size_spin.setValue(6)
             other.line_width_spin.setValue(0.5)
             other.include_annotations_style_check.setChecked(True)
 
             self.assertEqual(other.saved_style_combo.currentText(), "Nature main")
             self.assertTrue(other.apply_named_style("Nature main"))
-            self.assertEqual(other.title_edit.text(), "Keep this title")
+            self.assertEqual(other.title_edit.text(), "Copied title")
+            self.assertEqual(other.title_size_spin.value(), 17)
             self.assertEqual(other.axis_size_spin.value(), 11)
             self.assertAlmostEqual(other.line_width_spin.value(), 2.75)
             self.assertEqual([item.text for item in other.annotations], ["saved annotation"])
@@ -820,7 +1559,23 @@ class GraphDrawerWindowTests(unittest.TestCase):
         self.assertTrue(self.window.delete_named_style("Nature main", confirm=False))
         self.assertEqual(self.window.saved_style_payloads(), {})
 
-    def test_style_application_preserves_explicit_legend_visibility(self) -> None:
+    def test_copy_and_apply_style_copies_title_text_and_format(self) -> None:
+        self.window.new_graph()
+        self.window.title_edit.setText("Source title")
+        self.window.title_size_spin.setValue(18)
+        self.window.axis_size_spin.setValue(12)
+        self.window.copy_current_style()
+
+        self.window.title_edit.setText("Target title")
+        self.window.title_size_spin.setValue(5)
+        self.window.axis_size_spin.setValue(6)
+        self.window.apply_copied_style()
+
+        self.assertEqual(self.window.title_edit.text(), "Source title")
+        self.assertEqual(self.window.title_size_spin.value(), 18)
+        self.assertEqual(self.window.axis_size_spin.value(), 12)
+
+    def test_style_application_preserves_legend_mapping_and_copies_legend_format(self) -> None:
         self.window.table.item(0, 2).setText("Y")
         self.window.new_graph()
         self.window._set_checked_y_columns(["Col 2", "Col 3"])
@@ -829,19 +1584,43 @@ class GraphDrawerWindowTests(unittest.TestCase):
         self.window.series_by_y["Col 3"].show_in_legend = False
         self.window.plot_config.legend_entries = [
             LegendEntryConfig(source_y="Col 2", label="Only this entry"),
+            LegendEntryConfig(source_y="Col 3", label="Second entry"),
         ]
+        self.window.plot_config.legend_row_lengths = [1, 1]
 
         bundle = self.window.capture_current_style()
         bundle["series_templates"][0].show_in_legend = False
         bundle["series_templates"][1].show_in_legend = True
+        bundle["plot_config"].legend_entries = [
+            LegendEntryConfig(
+                source_y="Source column",
+                label="Source legend text",
+                font_family="DejaVu Sans",
+                font_size=13.0,
+                font_bold=True,
+                font_italic=True,
+                text_color="#123456",
+            )
+        ]
+        bundle["plot_config"].legend_row_lengths = [2]
         self.window.apply_style_bundle(bundle, "test style")
 
-        self.assertTrue(self.window.series_by_y["Col 2"].show_in_legend)
-        self.assertFalse(self.window.series_by_y["Col 3"].show_in_legend)
+        self.assertFalse(self.window.series_by_y["Col 2"].show_in_legend)
+        self.assertTrue(self.window.series_by_y["Col 3"].show_in_legend)
         self.assertEqual(
-            self.window.plot_config.legend_entries,
-            [LegendEntryConfig(source_y="Col 2", label="Only this entry")],
+            [
+                (entry.source_y, entry.label)
+                for entry in self.window.plot_config.legend_entries
+            ],
+            [("Col 2", "Only this entry"), ("Col 3", "Second entry")],
         )
+        for entry in self.window.plot_config.legend_entries:
+            self.assertEqual(entry.font_family, "DejaVu Sans")
+            self.assertEqual(entry.font_size, 13.0)
+            self.assertTrue(entry.font_bold)
+            self.assertTrue(entry.font_italic)
+            self.assertEqual(entry.text_color, "#123456")
+        self.assertEqual(self.window.plot_config.legend_row_lengths, [2])
 
 
 if __name__ == "__main__":

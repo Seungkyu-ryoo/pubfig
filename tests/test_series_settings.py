@@ -8,8 +8,9 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtWidgets import QApplication
 
-from pubfig.plot_config import SeriesConfig
+from pubfig.plot_config import FILLABLE_MARKERS, SeriesConfig
 from pubfig.ui.series_settings import SERIES_WIDGET_ALIASES, SeriesSettingsPanel
+from pubfig.ui.widgets import marker_preview_icon
 
 
 class SeriesSettingsPanelTests(unittest.TestCase):
@@ -34,6 +35,7 @@ class SeriesSettingsPanelTests(unittest.TestCase):
             plot_type="line+marker",
             y_axis="right",
             marker="s",
+            marker_fill_style="none",
             line_style="dashed",
             line_width=2.5,
             marker_size=7.0,
@@ -50,8 +52,19 @@ class SeriesSettingsPanelTests(unittest.TestCase):
         self.assertEqual(self.panel.label_edit.text(), "Signal")
         self.assertEqual(self.panel.axis_combo.currentText(), "right")
         self.assertEqual(self.panel.type_combo.currentText(), "line+marker")
+        self.assertEqual(self.panel.marker_combo.marker_code(), "s")
+        self.assertEqual(self.panel.marker_combo.fill_style(), "none")
+        self.assertEqual(self.panel.marker_combo.text(), "Open square")
         self.assertEqual(self.panel.color_button.text(), "#123456")
         self.assertEqual(self.panel.error_combo.currentText(), "sigma")
+        self.assertEqual(self.panel.error_cap_spin.value(), 3.5)
+        self.assertIn(
+            "Error bars",
+            [
+                self.panel.tabs.tabText(index)
+                for index in range(self.panel.tabs.count())
+            ],
+        )
 
         self.panel.label_edit.setText("  Revised  ")
         self.panel.axis_combo.setCurrentText("left")
@@ -74,6 +87,82 @@ class SeriesSettingsPanelTests(unittest.TestCase):
         self.assertEqual(result.color, "#abcdef")
         self.assertEqual((result.x, result.y, result.force_opaque), ("time", "signal", True))
         self.assertGreaterEqual(len(changes), 7)
+
+    def test_marker_picker_is_a_nine_by_twelve_icon_grid(self) -> None:
+        picker = self.panel.marker_combo
+
+        self.assertEqual(picker.option_count, 108)
+        self.assertEqual(picker.grid_shape, (9, 12))
+        self.assertTrue(all(not button.icon().isNull() for button in picker._buttons.values()))
+        for marker in FILLABLE_MARKERS:
+            for fill_style in ("full", "none", "left", "right", "bottom", "top"):
+                self.assertIn((marker, fill_style), picker._buttons)
+        self.assertIn((r"$\odot$", "full"), picker._buttons)
+        self.assertIn((r"$\oplus$", "full"), picker._buttons)
+        self.assertIn(("^", "full"), picker._buttons)
+        self.assertIn(("^", "none"), picker._buttons)
+        self.assertIn(("v", "full"), picker._buttons)
+        self.assertIn(("v", "none"), picker._buttons)
+
+        changes = []
+        self.panel.connect_changed(changes.append)
+        picker.set_choice("v", "none")
+
+        self.assertEqual(len(changes), 1)
+        self.assertIs(changes[0], picker)
+        self.assertEqual(picker.marker_code(), "v")
+        self.assertEqual(picker.fill_style(), "none")
+        self.assertEqual(picker.text(), "Open triangle down")
+
+        picker.set_choice("o", "left")
+        self.assertEqual(len(changes), 2)
+        self.assertEqual((picker.marker_code(), picker.fill_style()), ("o", "left"))
+        self.assertEqual(picker.text(), "Left-half circle")
+
+    def test_marker_picker_round_trips_display_and_custom_markers(self) -> None:
+        series = SeriesConfig(marker="^", marker_fill_style="none")
+        self.panel.load_series(series)
+
+        self.assertEqual(self.panel.marker_combo.text(), "Open triangle up")
+        self.assertNotIn(self.panel.marker_combo.text(), {"^", "v", "s"})
+        self.panel.marker_combo.set_choice("p", "full")
+        self.panel.update_series(series)
+        self.assertEqual((series.marker, series.marker_fill_style), ("p", "full"))
+
+        custom = SeriesConfig(marker="$A$", marker_fill_style="none")
+        self.panel.load_series(custom)
+        self.panel.update_series(custom)
+        self.assertEqual((custom.marker, custom.marker_fill_style), ("$A$", "none"))
+
+    def test_partial_circle_icons_fill_the_requested_half(self) -> None:
+        def alpha(fill_style: str, x: int, y: int) -> int:
+            image = marker_preview_icon("o", fill_style).pixmap(26, 26).toImage()
+            return image.pixelColor(x, y).alpha()
+
+        self.assertGreater(alpha("left", 8, 13), 200)
+        self.assertLess(alpha("left", 18, 13), 20)
+        self.assertLess(alpha("right", 8, 13), 20)
+        self.assertGreater(alpha("right", 18, 13), 200)
+        self.assertLess(alpha("bottom", 13, 8), 20)
+        self.assertGreater(alpha("bottom", 13, 18), 200)
+        self.assertGreater(alpha("top", 13, 8), 200)
+        self.assertLess(alpha("top", 13, 18), 20)
+
+    def test_point_and_pixel_icons_preserve_their_relative_size(self) -> None:
+        def opaque_width(marker: str) -> int:
+            image = marker_preview_icon(marker).pixmap(26, 26).toImage()
+            occupied_x = [
+                x
+                for x in range(image.width())
+                if any(
+                    image.pixelColor(x, y).alpha() > 0
+                    for y in range(image.height())
+                )
+            ]
+            return max(occupied_x) - min(occupied_x) + 1
+
+        self.assertGreater(opaque_width("o"), opaque_width("."))
+        self.assertGreater(opaque_width("s"), opaque_width(","))
 
     def test_empty_label_falls_back_to_series_y_and_unknown_error_is_none(self) -> None:
         series = SeriesConfig(x="x", y="temperature", label="Old", error_column="missing")

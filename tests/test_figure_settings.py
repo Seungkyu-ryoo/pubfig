@@ -14,12 +14,16 @@ from pubfig.ui.figure_settings import FigureSettingsPanel
 
 
 EXTERNAL_OR_DERIVED_FIELDS = {
+    "x_scientific_notation",
+    "y_scientific_notation",
+    "y2_scientific_notation",
     "annotations",
     "legend_anchor_x",
     "legend_anchor_y",
     "legend_entries",
     "legend_row_lengths",
     "plot_aspect_ratio",
+    "series_color_recipe",
     "transparent",
     "trim_whitespace",
 }
@@ -76,6 +80,15 @@ def populated_config() -> PlotConfig:
         "x_tick_interval": 2.25,
         "y_tick_interval": None,
         "y2_tick_interval": 4.75,
+        "x_tick_decimals": 0,
+        "y_tick_decimals": 2,
+        "y2_tick_decimals": 12,
+        "x_scientific_notation": False,
+        "y_scientific_notation": False,
+        "y2_scientific_notation": False,
+        "x_tick_notation": "plain",
+        "y_tick_notation": "scientific",
+        "y2_tick_notation": "shared",
         "x_minor_divisions": 2,
         "y_minor_divisions": 3,
         "y2_minor_divisions": 4,
@@ -119,6 +132,79 @@ class FigureSettingsPanelTests(unittest.TestCase):
         expected = {field.name for field in fields(PlotConfig)} - EXTERNAL_OR_DERIVED_FIELDS
         self.assertEqual(set(panel.bindings.fields), expected)
         self.assertEqual(len(panel.bindings.fields), len(set(panel.bindings.fields)))
+
+    def test_tick_decimals_can_switch_between_auto_and_fixed(self) -> None:
+        config = PlotConfig()
+        panel = FigureSettingsPanel(config)
+        sources = []
+        panel.connect_changed(sources.append)
+        for axis in ("x", "y", "y2"):
+            spin = getattr(panel, f"{axis}_tick_decimals_spin")
+            self.assertEqual(spin.text(), "Auto")
+            spin.setValue(0)
+            panel.update(config)
+            self.assertEqual(getattr(config, f"{axis}_tick_decimals"), 0)
+            self.assertIs(sources[-1], spin)
+            spin.setValue(2)
+            panel.update(config)
+            self.assertEqual(getattr(config, f"{axis}_tick_decimals"), 2)
+            spin.setValue(-1)
+            panel.update(config)
+            self.assertIsNone(getattr(config, f"{axis}_tick_decimals"))
+
+    def test_number_format_controls_default_to_auto_and_notify_changes(self) -> None:
+        config = PlotConfig()
+        panel = FigureSettingsPanel(config)
+        sources = []
+        panel.connect_changed(sources.append)
+        for axis in ("x", "y", "y2"):
+            combo = getattr(panel, f"{axis}_tick_notation_combo")
+            self.assertEqual(combo.currentData(), "auto")
+            combo.setCurrentIndex(combo.findData("plain"))
+            panel.update(config)
+            self.assertFalse(getattr(config, f"{axis}_scientific_notation"))
+            self.assertEqual(getattr(config, f"{axis}_tick_notation"), "plain")
+            self.assertIs(sources[-1], combo)
+            combo.setCurrentIndex(combo.findData("auto"))
+            panel.update(config)
+            self.assertTrue(getattr(config, f"{axis}_scientific_notation"))
+
+    def test_old_disabled_scientific_checkbox_loads_as_plain(self) -> None:
+        config = PlotConfig(y_scientific_notation=False)
+        panel = FigureSettingsPanel(config)
+        self.assertEqual(panel.y_tick_notation_combo.currentData(), "plain")
+        panel.update(config)
+        self.assertEqual(config.y_tick_notation, "plain")
+
+    def test_divisors_keep_last_valid_value_during_invalid_input(self) -> None:
+        config = PlotConfig(x_scale_divisor=0.001, y_scale_divisor=1e6, y2_scale_divisor=100)
+        panel = FigureSettingsPanel(config)
+        for axis, expected in (("x", .001), ("y", 1e6), ("y2", 100)):
+            edit = getattr(panel, f"{axis}_scale_divisor_edit")
+            for text in ("1e", "", "0", "-2", "nan", "inf", "10^6"):
+                with self.subTest(axis=axis, text=text):
+                    edit.setText(text)
+                    panel.update(config)
+                    self.assertEqual(getattr(config, f"{axis}_scale_divisor"), expected)
+                    self.assertTrue(edit.property("invalid"))
+            edit.setText("2e3")
+            panel.update(config)
+            self.assertEqual(getattr(config, f"{axis}_scale_divisor"), 2000)
+            self.assertFalse(edit.property("invalid"))
+            edit.setText("1")
+            panel.update(config)
+            self.assertEqual(getattr(config, f"{axis}_scale_divisor"), 1)
+
+    def test_divisor_fallback_resets_on_graph_load(self) -> None:
+        panel = FigureSettingsPanel(PlotConfig(y_scale_divisor=1e6))
+        panel.y_scale_divisor_edit.setText("1e")
+        self.assertTrue(panel.y_scale_divisor_edit.property("invalid"))
+        config = PlotConfig(y_scale_divisor=10)
+        panel.load(config)
+        self.assertFalse(panel.y_scale_divisor_edit.property("invalid"))
+        panel.y_scale_divisor_edit.setText("1e")
+        panel.update(config)
+        self.assertEqual(config.y_scale_divisor, 10)
 
     def test_constructor_and_explicit_load_round_trip_every_bound_field(self) -> None:
         source = populated_config()

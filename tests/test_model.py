@@ -102,6 +102,33 @@ class ProjectModelTests(unittest.TestCase):
         )
         self.assertIs(document.find_parent(graph_node.id), sheet_node)
 
+    def test_rename_node_updates_canonical_objects_and_tree_labels_together(self) -> None:
+        sheet = Sheet("sh1", "Sheet", pd.DataFrame())
+        graph = Graph("gr1", "Graph", sheet.id)
+        graph_node = TreeNode("ng", "graph", "stale graph", graph.id)
+        sheet_node = TreeNode(
+            "ns", "sheet", "stale sheet", sheet.id, children=[graph_node]
+        )
+        folder = TreeNode("nf", "folder", "Folder", children=[sheet_node])
+        document = ProjectDocument(
+            sheets={sheet.id: sheet},
+            graphs={graph.id: graph},
+            tree_root=TreeNode("root", "folder", "Project", children=[folder]),
+        )
+
+        self.assertTrue(document.rename_node(sheet_node.id, "Measurements"))
+        self.assertTrue(document.rename_node(graph_node.id, "Polarization"))
+        self.assertTrue(document.rename_node(folder.id, "4V pair"))
+        self.assertTrue(document.rename_node(document.tree_root.id, "HfO2"))
+        self.assertFalse(document.rename_node(sheet_node.id, "Measurements"))
+
+        self.assertEqual(sheet.name, "Measurements")
+        self.assertEqual(sheet_node.name, "Measurements")
+        self.assertEqual(graph.name, "Polarization")
+        self.assertEqual(graph_node.name, "Polarization")
+        self.assertEqual(folder.name, "4V pair")
+        self.assertEqual(document.tree_root.name, "HfO2")
+
 
 if __name__ == "__main__":
     unittest.main()

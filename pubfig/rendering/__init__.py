@@ -13,17 +13,26 @@ from .coordinator import (
     RenderRequest,
     clear_render_result,
 )
-from .core import RenderResult, render_figure
+from .core import (
+    DEFAULT_PREVIEW_POINT_LIMIT,
+    NumericColumnCache,
+    RenderOptions,
+    RenderResult,
+    render_figure,
+)
 from .export import export_figure
 
 __all__ = [
     "ArrowAnnotationArtist",
     "BatchExportResult",
+    "DEFAULT_PREVIEW_POINT_LIMIT",
     "ExportFailure",
     "ExportJob",
     "ExportOutcome",
     "MeasuredRender",
+    "NumericColumnCache",
     "RenderCoordinator",
+    "RenderOptions",
     "RenderResult",
     "RenderedBytes",
     "RenderRequest",

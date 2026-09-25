@@ -448,6 +448,7 @@ def color_swatch_style(color: str) -> str:
 
 def style_color_button(button: QPushButton, color: str) -> None:
     """Set *button*'s label to the hex code and apply the swatch style."""
+    color = str(color)
     button.setText(color)
     button.setStyleSheet(color_swatch_style(color))
 

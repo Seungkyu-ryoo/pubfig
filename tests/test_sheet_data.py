@@ -16,6 +16,7 @@ from pubfig.sheet_data import (
     normalize_column_names,
     normalize_dataframe_columns,
     plot_dataframe,
+    trim_trailing_empty_rows,
     with_metadata_rows,
     x_columns,
     y_columns,
@@ -75,6 +76,46 @@ class SheetDataTests(unittest.TestCase):
         self.assertEqual(sheet.iloc[ROLE_ROW].tolist(), ["X", "Y"])
         self.assertEqual(sheet.iloc[NAME_ROW].tolist(), ["Signal", "Signal_2"])
         self.assertEqual(plot_dataframe(sheet).values.tolist(), [["1", "2"], ["3", "4"]])
+
+    def test_trimming_preserves_metadata_and_internal_empty_rows(self) -> None:
+        source = pd.DataFrame(
+            [
+                ["X", "Y"],
+                ["", ""],
+                [1, 2],
+                ["", None],
+                [3, ""],
+                ["", None],
+                [pd.NA, float("nan")],
+            ],
+            columns=["x", "y"],
+            dtype=object,
+        )
+
+        trimmed = trim_trailing_empty_rows(source)
+
+        self.assertEqual(trimmed.shape, (5, 2))
+        self.assertEqual(trimmed.iloc[3].tolist(), ["", None])
+        self.assertEqual(source.shape, (7, 2))
+
+    def test_trimming_never_removes_two_blank_metadata_rows(self) -> None:
+        source = pd.DataFrame("", index=range(5), columns=["x", "y"])
+
+        trimmed = trim_trailing_empty_rows(source)
+
+        self.assertEqual(trimmed.shape, (DATA_START_ROW, 2))
+
+    def test_whitespace_is_data_but_import_drops_a_truly_empty_tail(self) -> None:
+        source = pd.DataFrame(
+            [[1, 2], ["", ""], [" ", ""], [None, ""]],
+            columns=["x", "y"],
+        )
+
+        imported = with_metadata_rows(source)
+
+        self.assertEqual(imported.shape, (5, 2))
+        self.assertEqual(imported.iloc[-2].tolist(), ["", ""])
+        self.assertEqual(imported.iloc[-1].tolist(), [" ", ""])
 
 
 if __name__ == "__main__":

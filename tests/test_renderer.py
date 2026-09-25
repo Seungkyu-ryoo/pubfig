@@ -6,13 +6,25 @@ import unittest
 from unittest.mock import MagicMock, patch
 
 from matplotlib.backends.backend_agg import FigureCanvasAgg
+from matplotlib.colors import to_rgba
+from matplotlib.figure import Figure
+from matplotlib.legend import Legend
+from matplotlib.offsetbox import DrawingArea
 import numpy as np
 import pandas as pd
 from PIL import Image
 
-from plot_config import LegendEntryConfig, PlotConfig, SeriesConfig
+from plot_config import (
+    FILLABLE_MARKERS,
+    AnnotationConfig,
+    LegendEntryConfig,
+    PlotConfig,
+    SeriesConfig,
+)
 from renderer import export_figure, render_figure
+from pubfig.legend_layout import legend_text_to_entries
 import pubfig.rendering.axes as rendering_axes
+from pubfig.rendering.artists import plot_series
 import pubfig.rendering.core as rendering_core
 
 
@@ -26,6 +38,154 @@ class RendererTests(unittest.TestCase):
             if (patch.get_gid() or "").startswith("pubfig_axis_arrow_")
         ]
 
+    @staticmethod
+    def _legend_item_boxes(legend):
+        return [
+            item
+            for column in legend._legend_handle_box.get_children()
+            for item in column.get_children()
+        ]
+
+    @staticmethod
+    def _legend_handle_box(item):
+        return next(
+            child
+            for child in item.get_children()
+            if isinstance(child, DrawingArea)
+        )
+
+    def test_open_triangle_renders_in_scatter_line_stem_and_legend(self) -> None:
+        figure = Figure()
+        axes = figure.subplots(1, 3)
+        series = SeriesConfig(
+            marker="^",
+            marker_fill_style="none",
+            marker_size=8.0,
+            line_width=1.5,
+        )
+        x_values = np.asarray([0.0, 1.0])
+        y_values = np.asarray([1.0, 2.0])
+        color = "#123456"
+
+        for axis, plot_type in zip(axes, ("scatter", "line+marker", "stem")):
+            plot_series(
+                axis,
+                x_values,
+                y_values,
+                series,
+                color,
+                plot_type,
+                plot_type,
+            )
+
+        scatter = axes[0].collections[0]
+        self.assertEqual(scatter.get_facecolors().size, 0)
+        np.testing.assert_allclose(scatter.get_edgecolors()[0], to_rgba(color))
+
+        line = axes[1].lines[0]
+        self.assertEqual(line.get_marker(), "^")
+        self.assertEqual(line.get_fillstyle(), "none")
+        self.assertEqual(line.get_markerfacecolor(), "none")
+        self.assertEqual(to_rgba(line.get_markeredgecolor()), to_rgba(color))
+
+        marker_line = next(item for item in axes[2].lines if item.get_marker() == "^")
+        self.assertEqual(marker_line.get_fillstyle(), "none")
+        self.assertEqual(marker_line.get_markerfacecolor(), "none")
+        self.assertEqual(to_rgba(marker_line.get_markeredgecolor()), to_rgba(color))
+
+        legend_handle = axes[1].legend().legend_handles[0]
+        self.assertEqual(legend_handle.get_marker(), "^")
+        self.assertEqual(legend_handle.get_fillstyle(), "none")
+        self.assertEqual(legend_handle.get_markerfacecolor(), "none")
+
+        stem_legend_handle = axes[2].legend().legend_handles[0]
+        self.assertEqual(stem_legend_handle.get_marker(), "^")
+        self.assertEqual(stem_legend_handle.get_fillstyle(), "none")
+        self.assertEqual(stem_legend_handle.get_markerfacecolor(), "none")
+
+    def test_filled_marker_remains_the_backward_compatible_default(self) -> None:
+        figure = Figure()
+        axis = figure.subplots()
+        series = SeriesConfig(marker="v", marker_size=8.0)
+
+        plot_series(
+            axis,
+            np.asarray([0.0]),
+            np.asarray([1.0]),
+            series,
+            "#4477AA",
+            "filled",
+            "line+marker",
+        )
+
+        line = axis.lines[0]
+        self.assertEqual(line.get_marker(), "v")
+        self.assertEqual(line.get_fillstyle(), "full")
+        self.assertEqual(to_rgba(line.get_markerfacecolor()), to_rgba("#4477AA"))
+
+    def test_half_filled_markers_keep_both_halves_in_every_plot_and_legend(self) -> None:
+        for marker in FILLABLE_MARKERS:
+            for fill_style in ("left", "right", "bottom", "top"):
+                with self.subTest(marker=marker, fill_style=fill_style):
+                    figure = Figure()
+                    axes = figure.subplots(1, 3)
+                    series = SeriesConfig(
+                        marker=marker,
+                        marker_fill_style=fill_style,
+                        marker_size=8.0,
+                    )
+                    try:
+                        for axis, plot_type in zip(
+                            axes,
+                            ("scatter", "line+marker", "stem"),
+                        ):
+                            plot_series(
+                                axis,
+                                np.asarray([0.0, 1.0]),
+                                np.asarray([1.0, 2.0]),
+                                series,
+                                "#123456",
+                                plot_type,
+                                plot_type,
+                            )
+
+                            marker_line = next(
+                                item
+                                for item in axis.lines
+                                if item.get_marker() == marker
+                            )
+                            self.assertEqual(marker_line.get_fillstyle(), fill_style)
+                            self.assertIsNotNone(marker_line._marker.get_alt_path())
+                            self.assertEqual(
+                                to_rgba(marker_line.get_markerfacecolor()),
+                                to_rgba("#123456"),
+                            )
+                            self.assertEqual(
+                                marker_line.get_markerfacecoloralt(),
+                                "none",
+                            )
+                            self.assertEqual(
+                                to_rgba(marker_line.get_markeredgecolor()),
+                                to_rgba("#123456"),
+                            )
+
+                            legend_handle = axis.legend().legend_handles[0]
+                            self.assertEqual(legend_handle.get_marker(), marker)
+                            self.assertEqual(
+                                legend_handle.get_fillstyle(),
+                                fill_style,
+                            )
+                            self.assertEqual(
+                                legend_handle.get_markerfacecoloralt(),
+                                "none",
+                            )
+
+                        # Half-filled scatter deliberately uses a marker-only
+                        # Line2D; PathCollection would discard the alternate half.
+                        self.assertEqual(len(axes[0].collections), 0)
+                    finally:
+                        figure.clear()
+
     def test_duplicate_column_identifiers_are_rejected_at_render_boundary(self) -> None:
         frame = pd.DataFrame([[0, 1], [1, 2]], columns=["value", "value"])
 
@@ -35,6 +195,29 @@ class RendererTests(unittest.TestCase):
                 PlotConfig(),
                 [SeriesConfig(x="value", y="value")],
             )
+
+    def test_annotations_render_without_a_plottable_series(self) -> None:
+        config = PlotConfig(
+            annotations=[
+                AnnotationConfig(kind="text", text="note", x=0.4, y=0.6)
+            ]
+        )
+        cases = (
+            (pd.DataFrame(), []),
+            (
+                pd.DataFrame({"x": ["bad"], "y": ["also bad"]}),
+                [SeriesConfig(x="x", y="y")],
+            ),
+        )
+
+        for frame, series in cases:
+            with self.subTest(series_count=len(series)):
+                result = render_figure(frame, config, series)
+                self.addCleanup(result.figure.clear)
+                FigureCanvasAgg(result.figure).draw()
+
+                self.assertEqual(len(result.annotation_artists), 1)
+                self.assertEqual(result.annotation_artists[0].get_text(), "note")
 
     def test_render_failure_clears_its_partially_built_figure(self) -> None:
         frame = pd.DataFrame({"x": [0, 1], "y": [1, 2]})
@@ -443,6 +626,57 @@ class RendererTests(unittest.TestCase):
             self.assertAlmostEqual(measured_gap_mm, requested_gap_mm, delta=0.05)
         self.assertAlmostEqual(measured_gaps[0], measured_gaps[1], delta=0.01)
 
+    def test_space_separated_legend_samples_render_as_two_columns(self) -> None:
+        sources = [
+            "col5",
+            "col10",
+            "col15",
+            "col20",
+            "col25",
+            "col30",
+            "col35",
+            "col40",
+        ]
+        text = (
+            "\\L(1) %(1) \\L(5) %(5)\n"
+            "\\L(2) %(2) \\L(6) %(6)\n"
+            "\\L(3) %(3) \\L(7) %(7)\n"
+            "\\L(4) %(4) \\L(8) %(8)"
+        )
+        entries, row_lengths = legend_text_to_entries(text, sources)
+        frame = pd.DataFrame(
+            {
+                "x": [0.0, 1.0],
+                **{
+                    source: [float(index), float(index + 1)]
+                    for index, source in enumerate(sources)
+                },
+            }
+        )
+
+        result = render_figure(
+            frame,
+            PlotConfig(
+                legend_entries=entries,
+                legend_row_lengths=row_lengths,
+            ),
+            [
+                SeriesConfig(
+                    x="x",
+                    y=source,
+                    label=source,
+                    plot_type="line+marker",
+                )
+                for source in sources
+            ],
+        )
+        FigureCanvasAgg(result.figure).draw()
+
+        self.assertEqual(result.legend_artist._ncols, 2)
+        labels = [text.get_text() for text in result.legend_artist.get_texts()]
+        self.assertEqual(labels, sources)
+        self.assertTrue(all("\\L(" not in label for label in labels))
+
     def test_legend_entries_pair_independent_handles_and_names(self) -> None:
         frame = pd.DataFrame(
             {
@@ -521,7 +755,317 @@ class RendererTests(unittest.TestCase):
             ["D", "D"],
         )
 
-    def test_legend_entries_skip_hidden_and_missing_sources_without_breaking_rows(self) -> None:
+    def test_automatic_legend_honors_series_visibility(self) -> None:
+        frame = pd.DataFrame(
+            {
+                "x": [0, 1],
+                "a": [1, 2],
+                "b": [2, 3],
+            }
+        )
+        result = render_figure(
+            frame,
+            PlotConfig(),
+            [
+                SeriesConfig(x="x", y="a", label="Visible A"),
+                SeriesConfig(
+                    x="x",
+                    y="b",
+                    label="Hidden B",
+                    show_in_legend=False,
+                ),
+            ],
+        )
+        FigureCanvasAgg(result.figure).draw()
+
+        self.assertEqual(
+            [text.get_text() for text in result.legend_artist.get_texts()],
+            ["Visible A"],
+        )
+
+    def test_explicit_legend_is_authoritative_and_can_use_a_hidden_series(self) -> None:
+        frame = pd.DataFrame(
+            {
+                "x": [0, 1],
+                "a": [1, 2],
+                "b": [2, 3],
+            }
+        )
+        config = PlotConfig(
+            legend_entries=[
+                LegendEntryConfig(source_y="b", label="Only hidden B"),
+            ]
+        )
+        series = [
+            SeriesConfig(
+                x="x",
+                y="a",
+                label="Omitted A",
+                marker="o",
+                plot_type="line+marker",
+            ),
+            SeriesConfig(
+                x="x",
+                y="b",
+                label="Default B",
+                marker="s",
+                plot_type="line+marker",
+                show_in_legend=False,
+            ),
+        ]
+
+        result = render_figure(frame, config, series)
+        FigureCanvasAgg(result.figure).draw()
+
+        self.assertEqual(
+            [text.get_text() for text in result.legend_artist.get_texts()],
+            ["Only hidden B"],
+        )
+        self.assertEqual(
+            [handle.get_marker() for handle in result.legend_artist.legend_handles],
+            ["s"],
+        )
+
+    def test_explicit_legend_supports_free_text_blank_rows_and_origin_names(self) -> None:
+        frame = pd.DataFrame(
+            {
+                "x": [0, 1],
+                "a": [1, 2],
+                "b": [2, 3],
+            }
+        )
+        config = PlotConfig(
+            legend_entries=[
+                LegendEntryConfig(source_y="", label="Group: %(2)"),
+                LegendEntryConfig(source_y="deleted", label="Missing: %(1)"),
+                LegendEntryConfig(source_y="", label=""),
+                LegendEntryConfig(source_y="b", label="%(1) + literal %(9)"),
+            ],
+        )
+        series = [
+            SeriesConfig(
+                x="x",
+                y="b",
+                label="Beta",
+                marker="s",
+                plot_type="line+marker",
+                y_axis="right",
+            ),
+            SeriesConfig(
+                x="x",
+                y="a",
+                label="Alpha",
+                marker="o",
+                plot_type="line+marker",
+            ),
+        ]
+
+        result = render_figure(frame, config, series)
+        FigureCanvasAgg(result.figure).draw()
+
+        self.assertEqual(
+            [text.get_text() for text in result.legend_artist.get_texts()],
+            ["Group: Beta", "Missing: Alpha", "", "Alpha + literal %(9)"],
+        )
+        handles = result.legend_artist.legend_handles
+        self.assertEqual(
+            [handle.get_alpha() for handle in handles[:3]],
+            [0, 0, 0],
+        )
+        self.assertEqual(handles[3].get_marker(), "s")
+
+    def test_text_only_legend_starts_at_content_left_and_keeps_standard_bbox(self) -> None:
+        frame = pd.DataFrame({"x": [0, 1], "y": [1, 2]})
+        config = PlotConfig(
+            dpi=100,
+            fixed_plot_area=False,
+            legend_size=8,
+            legend_anchor_x=0.05,
+            legend_anchor_y=0.95,
+            legend_entries=[
+                LegendEntryConfig(
+                    label="HfN",
+                    font_family="DejaVu Sans",
+                    font_size=13.5,
+                    font_bold=True,
+                    font_italic=True,
+                    text_color="#123456",
+                ),
+                LegendEntryConfig(source_y="y", label="4.5V"),
+            ],
+        )
+
+        result = render_figure(
+            frame,
+            config,
+            [SeriesConfig(x="x", y="y", marker="o", plot_type="line+marker")],
+        )
+        canvas = FigureCanvasAgg(result.figure)
+        canvas.draw()
+        renderer = canvas.get_renderer()
+        legend = result.legend_artist
+
+        self.assertIsInstance(legend, Legend)
+        items = self._legend_item_boxes(legend)
+        heading_handle_box = self._legend_handle_box(items[0])
+        sample_handle_box = self._legend_handle_box(items[1])
+        heading, sample_label = legend.get_texts()
+        heading_bbox = heading.get_window_extent(renderer)
+        sample_handle_bbox = sample_handle_box.get_window_extent(renderer)
+
+        self.assertFalse(heading_handle_box.get_visible())
+        self.assertTrue(sample_handle_box.get_visible())
+        self.assertAlmostEqual(heading_bbox.x0, sample_handle_bbox.x0, places=5)
+        self.assertGreater(
+            sample_label.get_window_extent(renderer).x0,
+            heading_bbox.x0,
+        )
+        self.assertEqual(heading.get_fontfamily(), ["DejaVu Sans"])
+        self.assertAlmostEqual(heading.get_fontsize(), 13.5)
+        self.assertEqual(heading.get_fontweight(), "bold")
+        self.assertEqual(heading.get_fontstyle(), "italic")
+        self.assertEqual(heading.get_color(), "#123456")
+
+        legend_bbox = legend.get_window_extent(renderer)
+        self.assertTrue(legend_bbox.contains(heading_bbox.x0, heading_bbox.y0))
+        self.assertTrue(legend_bbox.contains(heading_bbox.x1, heading_bbox.y1))
+        relative_heading_x = heading_bbox.x0 - legend_bbox.x0
+        original_legend_x = legend_bbox.x0
+
+        legend._loc = 2
+        legend.set_bbox_to_anchor((0.35, 0.70), transform=legend.axes.transAxes)
+        canvas.draw()
+        moved_legend_bbox = legend.get_window_extent(renderer)
+        moved_heading_bbox = heading.get_window_extent(renderer)
+        self.assertNotAlmostEqual(moved_legend_bbox.x0, original_legend_x)
+        self.assertAlmostEqual(
+            moved_heading_bbox.x0 - moved_legend_bbox.x0,
+            relative_heading_x,
+            places=5,
+        )
+
+    def test_multicol_legend_keeps_style_mapping_and_grid_fillers(self) -> None:
+        frame = pd.DataFrame(
+            {
+                "x": [0, 1],
+                "a": [1, 2],
+                "b": [2, 3],
+            }
+        )
+        config = PlotConfig(
+            fixed_plot_area=False,
+            legend_size=8,
+            legend_row_lengths=[1, 2, 1],
+            legend_entries=[
+                LegendEntryConfig(
+                    label="Heading",
+                    font_size=11,
+                    text_color="#aa0000",
+                ),
+                LegendEntryConfig(
+                    source_y="a",
+                    label="Series A",
+                    font_size=12,
+                    font_bold=True,
+                    text_color="#00aa00",
+                ),
+                LegendEntryConfig(
+                    source_y="b",
+                    label="Series B",
+                    font_size=13,
+                    font_italic=True,
+                    text_color="#0000aa",
+                ),
+                LegendEntryConfig(
+                    source_y="missing",
+                    label="Tail",
+                    font_size=float("nan"),
+                    text_color="not-a-matplotlib-color",
+                ),
+            ],
+        )
+
+        result = render_figure(
+            frame,
+            config,
+            [
+                SeriesConfig(x="x", y="a", marker="o", plot_type="line+marker"),
+                SeriesConfig(x="x", y="b", marker="s", plot_type="line+marker"),
+            ],
+        )
+        canvas = FigureCanvasAgg(result.figure)
+        canvas.draw()
+        renderer = canvas.get_renderer()
+        legend = result.legend_artist
+        texts = legend.get_texts()
+
+        self.assertEqual(legend._ncols, 2)
+        self.assertEqual(
+            [text.get_text() for text in texts],
+            ["Heading", "Series A", "Tail", " ", "Series B", " "],
+        )
+        by_label = {
+            text.get_text(): text
+            for text in texts
+            if text.get_text().strip()
+        }
+        self.assertEqual(by_label["Heading"].get_color(), "#aa0000")
+        self.assertAlmostEqual(by_label["Heading"].get_fontsize(), 11)
+        self.assertEqual(by_label["Series A"].get_color(), "#00aa00")
+        self.assertAlmostEqual(by_label["Series A"].get_fontsize(), 12)
+        self.assertEqual(by_label["Series A"].get_fontweight(), "bold")
+        self.assertEqual(by_label["Series B"].get_color(), "#0000aa")
+        self.assertAlmostEqual(by_label["Series B"].get_fontsize(), 13)
+        self.assertEqual(by_label["Series B"].get_fontstyle(), "italic")
+        self.assertAlmostEqual(by_label["Tail"].get_fontsize(), config.legend_size)
+        self.assertNotEqual(
+            by_label["Tail"].get_color(),
+            "not-a-matplotlib-color",
+        )
+
+        items = self._legend_item_boxes(legend)
+        heading_bbox = by_label["Heading"].get_window_extent(renderer)
+        first_sample_handle_bbox = self._legend_handle_box(items[1]).get_window_extent(
+            renderer
+        )
+        self.assertAlmostEqual(
+            heading_bbox.x0,
+            first_sample_handle_bbox.x0,
+            places=5,
+        )
+        self.assertFalse(self._legend_handle_box(items[0]).get_visible())
+        self.assertFalse(self._legend_handle_box(items[2]).get_visible())
+        self.assertTrue(self._legend_handle_box(items[3]).get_visible())
+
+    def test_explicit_empty_legend_draws_no_legend(self) -> None:
+        frame = pd.DataFrame({"x": [0, 1], "y": [1, 2]})
+
+        result = render_figure(
+            frame,
+            PlotConfig(legend_entries=[]),
+            [SeriesConfig(x="x", y="y", label="Omitted")],
+        )
+
+        self.assertIsNone(result.legend_artist)
+
+    def test_explicit_series_entry_with_empty_label_uses_its_default_name(self) -> None:
+        frame = pd.DataFrame({"x": [0, 1], "y": [1, 2]})
+
+        result = render_figure(
+            frame,
+            PlotConfig(
+                legend_entries=[LegendEntryConfig(source_y="y", label="")]
+            ),
+            [SeriesConfig(x="x", y="y", label="Legacy default")],
+        )
+        FigureCanvasAgg(result.figure).draw()
+
+        self.assertEqual(
+            [text.get_text() for text in result.legend_artist.get_texts()],
+            ["Legacy default"],
+        )
+
+    def test_explicit_legend_compacts_rows_after_an_invisible_entry(self) -> None:
         frame = pd.DataFrame(
             {
                 "x": [0, 1],
@@ -530,39 +1074,32 @@ class RendererTests(unittest.TestCase):
                 "c": [3, 4],
             }
         )
-        config = PlotConfig(
-            legend_entries=[
-                LegendEntryConfig(source_y="a", label="Visible A"),
-                LegendEntryConfig(source_y="deleted", label="Deleted"),
-                LegendEntryConfig(source_y="b", label="Hidden B"),
-                LegendEntryConfig(source_y="c", label="Visible C"),
-            ],
-            legend_row_lengths=[2, 2],
-        )
-        series = [
-            SeriesConfig(x="x", y="a", marker="o", plot_type="line+marker"),
-            SeriesConfig(
-                x="x",
-                y="b",
-                marker="s",
-                plot_type="line+marker",
-                show_in_legend=False,
-            ),
-            SeriesConfig(x="x", y="c", marker="D", plot_type="line+marker"),
+        config = PlotConfig(legend_row_lengths=[2, 2])
+        # Assign dictionaries after construction so this test also covers the
+        # renderer's tolerant payload path independently of model coercion.
+        config.legend_entries = [
+            {"source_y": "a", "label": "A"},
+            {"source_y": "b", "label": "Hidden", "visible": False},
+            {"source_y": "c", "label": "C"},
+            {"source_y": "", "label": "Tail"},
         ]
 
-        result = render_figure(frame, config, series)
+        result = render_figure(
+            frame,
+            config,
+            [
+                SeriesConfig(x="x", y="a"),
+                SeriesConfig(x="x", y="b"),
+                SeriesConfig(x="x", y="c"),
+            ],
+        )
         FigureCanvasAgg(result.figure).draw()
 
+        self.assertEqual(result.legend_artist._ncols, 2)
         self.assertEqual(
             [text.get_text() for text in result.legend_artist.get_texts()],
-            ["Visible A", "Visible C"],
+            ["A", "C", " ", "Tail"],
         )
-        self.assertEqual(
-            [handle.get_marker() for handle in result.legend_artist.legend_handles],
-            ["o", "D"],
-        )
-        self.assertEqual(result.legend_artist._ncols, 1)
 
     def test_broken_axis_legend_stays_above_the_sibling_plot(self) -> None:
         frame = pd.DataFrame(

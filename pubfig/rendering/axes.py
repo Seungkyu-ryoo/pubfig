@@ -19,8 +19,9 @@ from matplotlib.ticker import (
     NullLocator,
 )
 
-from ..plot_config import PALETTE, PlotConfig, SeriesConfig
+from ..plot_config import PALETTE, PlotConfig, SeriesConfig, axis_tick_notation
 from .artists import format_plot_text
+from .tick_formatting import apply_tick_divisor, apply_tick_format
 
 
 @dataclass(frozen=True)
@@ -447,8 +448,8 @@ def scale_divisor(value: float, label: str, warnings: list[str]) -> float:
     except (TypeError, ValueError):
         warnings.append(f"{label} divisor is invalid; using 1.")
         return 1.0
-    if divisor <= 0:
-        warnings.append(f"{label} divisor must be positive; using 1.")
+    if not math.isfinite(divisor) or divisor <= 0:
+        warnings.append(f"{label} divisor must be finite and positive; using 1.")
         return 1.0
     return divisor
 
@@ -768,12 +769,18 @@ def resolve_y_limit(
 def apply_tick_intervals(ax, config: PlotConfig, warnings: list[str], side: str) -> None:
     apply_major_locator(ax.xaxis, config.x_scale, config.x_tick_interval, warnings, "X")
     apply_minor_locator(ax.xaxis, config.x_scale, config.x_minor_divisions)
+    apply_tick_format(ax.xaxis, axis_tick_notation(config, "x"), config.x_tick_decimals, warnings, "X")
+    apply_tick_divisor(ax.xaxis, scale_divisor(config.x_scale_divisor, "X", warnings))
     y_interval = config.y2_tick_interval if side == "right" else config.y_tick_interval
     y_scale = config.y2_scale if side == "right" else config.y_scale
     y_minor_divisions = config.y2_minor_divisions if side == "right" else config.y_minor_divisions
     label = "Y2" if side == "right" else "Y"
     apply_major_locator(ax.yaxis, y_scale, y_interval, warnings, label)
     apply_minor_locator(ax.yaxis, y_scale, y_minor_divisions)
+    y_decimals = config.y2_tick_decimals if side == "right" else config.y_tick_decimals
+    apply_tick_format(ax.yaxis, axis_tick_notation(config, label.lower()), y_decimals, warnings, label)
+    divisor = config.y2_scale_divisor if side == "right" else config.y_scale_divisor
+    apply_tick_divisor(ax.yaxis, scale_divisor(divisor, label, warnings))
 
 
 def apply_major_locator(axis_obj, scale: str, interval: float | None, warnings: list[str], label: str) -> None:

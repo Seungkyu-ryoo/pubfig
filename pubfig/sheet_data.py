@@ -92,7 +92,13 @@ def blank_dataframe(rows: int = 20, columns: int = 4) -> pd.DataFrame:
 def with_metadata_rows(data_df: pd.DataFrame) -> pd.DataFrame:
     """Prepend default role and display-name rows to imported data."""
 
-    data = normalize_dataframe_columns(data_df)
+    # Spreadsheet exports can carry their entire formatted row range even
+    # though the rows after the actual data are empty.  Drop that tail before
+    # copying/converting the import so it never becomes part of the in-memory
+    # project in the first place.
+    data = normalize_dataframe_columns(
+        trim_trailing_empty_rows(data_df, minimum_rows=0, copy=False)
+    )
     columns = list(data.columns)
     roles = ["X" if index == 0 else "Y" for index in range(len(columns))]
     metadata = pd.DataFrame([roles, columns], columns=columns, dtype=object)
@@ -112,6 +118,51 @@ def ensure_metadata_rows(df: pd.DataFrame) -> pd.DataFrame:
     return result
 
 
+def trim_trailing_empty_rows(
+    df: pd.DataFrame,
+    *,
+    minimum_rows: int = DATA_START_ROW,
+    copy: bool = True,
+) -> pd.DataFrame:
+    """Remove only the contiguous all-empty row tail from ``df``.
+
+    ``None``, pandas missing values, and the empty string count as empty.  A
+    whitespace-only string remains data: silently discarding it would change
+    an explicitly entered cell.  Rows before ``minimum_rows`` are always
+    retained, which protects pubfig's role/name metadata rows even when both
+    are blank.
+
+    The source frame is never modified.  When a tail is removed, ``copy=True``
+    materializes the retained portion so the discarded backing storage can be
+    released.  Serialization can use ``copy=False`` because its view is
+    short-lived.
+    """
+
+    if not isinstance(minimum_rows, int) or isinstance(minimum_rows, bool):
+        raise TypeError("minimum_rows must be an integer")
+    if minimum_rows < 0:
+        raise ValueError("minimum_rows must be non-negative")
+    if not isinstance(copy, bool):
+        raise TypeError("copy must be a boolean")
+
+    row_count = len(df)
+    floor = min(minimum_rows, row_count)
+    if row_count <= floor:
+        return df
+
+    candidate = df.iloc[floor:]
+    # Keep this operation columnar.  In particular, avoid applying a Python
+    # predicate to every cell in Excel-sized sheets.
+    occupied_rows = (candidate.notna() & candidate.ne("")).any(axis=1)
+    occupied_positions = occupied_rows.to_numpy().nonzero()[0]
+    stop = floor if not len(occupied_positions) else floor + int(occupied_positions[-1]) + 1
+    if stop == row_count:
+        return df
+
+    result = df.iloc[:stop]
+    return result.copy(deep=True) if copy else result
+
+
 def plot_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     """Return only plotted rows, with a fresh positional index."""
 
@@ -128,8 +179,8 @@ def _column_position(df: pd.DataFrame, column: str) -> int | None:
     return None
 
 
-def normalize_role(value: Any) -> str:
-    """Normalize a role cell to ``X``, ``Y``, or the empty role."""
+def normalize_role(value: Any, *, preserve_unknown: bool = False) -> str:
+    """Normalize roles; editors may preserve unrecognized text for correction."""
 
     if value is None or pd.isna(value):
         return ""
@@ -138,7 +189,9 @@ def normalize_role(value: Any) -> str:
         return "X"
     if text.startswith("Y"):
         return "Y"
-    return ""
+    if text in ("", "NONE", "-"):
+        return ""
+    return str(value) if preserve_unknown else ""
 
 
 def column_role(df: pd.DataFrame, column: str) -> str:
@@ -228,6 +281,7 @@ __all__ = [
     "project_column_role",
     "project_nearest_left_x",
     "project_plot_dataframe",
+    "trim_trailing_empty_rows",
     "unique_column_names",
     "with_metadata_rows",
     "x_columns",

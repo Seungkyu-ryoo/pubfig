@@ -5,9 +5,31 @@ from __future__ import annotations
 from collections.abc import Callable, Iterable, Iterator, Mapping, MutableMapping
 from contextlib import contextmanager
 from dataclasses import dataclass
+import math
 from typing import Any, Generic, TypeVar
 
 from PySide6.QtCore import QObject, QSignalBlocker
+
+
+def change_signal(widget: QObject):
+    """Return the primary edit signal shared by settings widgets."""
+    for name in ("textChanged", "currentTextChanged", "valueChanged", "toggled"):
+        signal = getattr(widget, name, None)
+        if signal is not None:
+            return signal
+    return None
+
+
+def optional_float(edit) -> float | None:
+    """Read a finite numeric field; blank or invalid input has no value."""
+    text = edit.text().strip()
+    if not text:
+        return None
+    try:
+        value = float(text)
+    except ValueError:
+        return None
+    return value if math.isfinite(value) else None
 
 
 ValueT = TypeVar("ValueT")
@@ -251,4 +273,4 @@ class BindingRegistry:
                 pass
 
 
-__all__ = ["BindingRegistry", "FieldBinding", "signals_blocked"]
+__all__ = ["BindingRegistry", "FieldBinding", "change_signal", "optional_float", "signals_blocked"]

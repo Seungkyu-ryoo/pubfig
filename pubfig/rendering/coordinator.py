@@ -16,6 +16,7 @@ from __future__ import annotations
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+import inspect
 from io import BytesIO
 from pathlib import Path
 from typing import Any
@@ -24,7 +25,7 @@ from matplotlib.backends.backend_agg import FigureCanvasAgg
 import pandas as pd
 
 from ..plot_config import PlotConfig, SeriesConfig
-from .core import RenderResult, render_figure
+from .core import RenderOptions, RenderResult, render_figure
 from .export import export_figure
 
 
@@ -36,6 +37,7 @@ class RenderRequest:
     config: PlotConfig
     series_configs: Sequence[SeriesConfig]
     label: str = ""
+    render_options: RenderOptions = field(default_factory=RenderOptions)
 
 
 @dataclass(frozen=True)
@@ -158,12 +160,13 @@ class RenderCoordinator:
     def __init__(
         self,
         *,
-        render: Callable[[pd.DataFrame, PlotConfig, list[SeriesConfig]], RenderResult] = render_figure,
+        render: Callable[..., RenderResult] = render_figure,
         export: Callable[[Any, str | Path, PlotConfig], None] = export_figure,
         cleanup: Callable[[RenderResult], None] = clear_render_result,
         canvas_factory: Callable[[Any], Any] = FigureCanvasAgg,
     ) -> None:
         self._render = render
+        self._render_accepts_options = _accepts_keyword(render, "options")
         self._export = export
         self._cleanup = cleanup
         self._canvas_factory = canvas_factory
@@ -171,11 +174,27 @@ class RenderCoordinator:
     def render(self, request: RenderRequest) -> RenderResult:
         """Render once and transfer the resulting Figure to the caller."""
         self._validate_request(request)
-        return self._render(
+        return self._invoke_render(request, request.render_options)
+
+    def _invoke_render(
+        self,
+        request: RenderRequest,
+        options: RenderOptions,
+    ) -> RenderResult:
+        args = (
             request.dataframe,
             request.config,
             list(request.series_configs),
         )
+        if self._render_accepts_options:
+            return self._render(*args, options=options)
+        # Preserve compatibility with injected three-argument renderers.  Such
+        # renderers simply receive their historical full-resolution inputs.
+        return self._render(*args)
+
+    def _render_full_resolution(self, request: RenderRequest) -> RenderResult:
+        self._validate_request(request)
+        return self._invoke_render(request, RenderOptions())
 
     def render_for_display(
         self,
@@ -236,13 +255,16 @@ class RenderCoordinator:
                 raise ValueError("Pass the image format through the format argument")
             kwargs.update(savefig_kwargs)
         buffer = BytesIO()
-        with self.temporary(request) as result:
+        result = self._render_full_resolution(request)
+        try:
             result.figure.savefig(buffer, **kwargs)
             return RenderedBytes(
                 data=buffer.getvalue(),
                 warnings=tuple(result.warnings),
                 format=image_format,
             )
+        finally:
+            self.cleanup(result)
 
     def export_one(
         self,
@@ -264,7 +286,7 @@ class RenderCoordinator:
         if accept is not None and not callable(accept):
             raise TypeError("accept must be callable")
 
-        result = self.render(job.request)
+        result = self._render_full_resolution(job.request)
         retained = False
         try:
             self._export(result.figure, job.resolved_path, job.request.config)
@@ -324,6 +346,27 @@ class RenderCoordinator:
             raise TypeError("RenderRequest.dataframe must be a pandas DataFrame")
         if not isinstance(request.config, PlotConfig):
             raise TypeError("RenderRequest.config must be PlotConfig")
+        if not isinstance(request.render_options, RenderOptions):
+            raise TypeError("RenderRequest.render_options must be RenderOptions")
+
+
+def _accepts_keyword(function: Callable[..., Any], keyword: str) -> bool:
+    """Whether an injectable callable supports a keyword without invoking it."""
+
+    try:
+        parameters = inspect.signature(function).parameters
+    except (TypeError, ValueError):
+        return False
+    parameter = parameters.get(keyword)
+    if parameter is not None and parameter.kind in {
+        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        inspect.Parameter.KEYWORD_ONLY,
+    }:
+        return True
+    return any(
+        item.kind is inspect.Parameter.VAR_KEYWORD
+        for item in parameters.values()
+    )
 
 
 __all__ = [

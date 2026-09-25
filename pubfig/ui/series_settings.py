@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterable
 import json
+import math
 from typing import Any
 
 from PySide6.QtCore import Qt, Signal
@@ -23,10 +24,22 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from ..plot_config import LINE_STYLES, MARKERS, PLOT_TYPES, RECOMMENDED_PALETTES, SeriesConfig
-from ..theme import color_swatch_style
-from .binding import BindingRegistry, FieldBinding, signals_blocked
-from .widgets import GradientEditorWidget, NoWheelComboBox, NoWheelDoubleSpinBox
+from ..fitting import LinearFitResult
+from ..plot_config import LINE_STYLES, PLOT_TYPES, RECOMMENDED_PALETTES, SeriesConfig
+from ..theme import style_color_button
+from .binding import (
+    BindingRegistry,
+    FieldBinding,
+    change_signal,
+    optional_float,
+    signals_blocked,
+)
+from .widgets import (
+    GradientEditorWidget,
+    MarkerGridPicker,
+    NoWheelComboBox,
+    NoWheelDoubleSpinBox,
+)
 
 
 PLOT_TYPE_HELP = {
@@ -58,6 +71,12 @@ SERIES_WIDGET_ALIASES: dict[str, str] = {
     "show_in_legend_check": "legend_check",
     "error_column_combo": "error_combo",
     "error_cap_spin": "error_cap_spin",
+    "linear_fit_enabled_check": "linear_fit_enabled_check",
+    "linear_fit_x_min_edit": "linear_fit_x_min_edit",
+    "linear_fit_x_max_edit": "linear_fit_x_max_edit",
+    "linear_fit_line_style_combo": "linear_fit_line_style_combo",
+    "linear_fit_line_width_spin": "linear_fit_line_width_spin",
+    "linear_fit_result_label": "linear_fit_result_label",
     "cmap_column_list": "cmap_column_list",
     "cmap_select_all_btn": "cmap_select_all_button",
     "cmap_select_none_btn": "cmap_select_none_button",
@@ -97,6 +116,7 @@ class SeriesSettingsPanel(QGroupBox):
         parent: QWidget | None = None,
     ) -> None:
         super().__init__("Series style", parent)
+        self._editor_enabled = True
         self._build_controls()
         self._build_layout()
         self.bindings = self._build_bindings()
@@ -119,10 +139,7 @@ class SeriesSettingsPanel(QGroupBox):
             combo.setCurrentText(current)
         return combo
 
-    @staticmethod
-    def _set_color(button: QPushButton, color: str) -> None:
-        button.setText(color)
-        button.setStyleSheet(color_swatch_style(color))
+    _set_color = staticmethod(style_color_button)
 
     def _build_controls(self) -> None:
         self.target_combo = NoWheelComboBox()
@@ -131,7 +148,7 @@ class SeriesSettingsPanel(QGroupBox):
         self.type_combo = self._combo(PLOT_TYPES, "line")
         self.type_help = QLabel(PLOT_TYPE_HELP["line"])
         self.type_help.setWordWrap(True)
-        self.marker_combo = self._combo(MARKERS, "o")
+        self.marker_combo = MarkerGridPicker()
         self.line_style_combo = self._combo(LINE_STYLES, "solid")
         self.line_width_spin = self._double(1.0, 0.1, 10.0, 2)
         self.marker_size_spin = self._double(4.0, 0.0, 30.0, 1)
@@ -144,9 +161,35 @@ class SeriesSettingsPanel(QGroupBox):
         self.error_combo = NoWheelComboBox()
         self.error_combo.addItem("(none)")
         self.error_combo.setToolTip(
-            "Column holding the ± error magnitude for this series; drawn as Y error bars."
+            "Each numeric cell supplies the ±Y error for the scatter point in "
+            "the same row. Blank or non-numeric cells skip that error bar."
         )
         self.error_cap_spin = self._double(2.0, 0.0, 20.0, 1)
+
+        self.linear_fit_enabled_check = QCheckBox("Enable linear fit")
+        self.linear_fit_enabled_check.setToolTip(
+            "Fit y = mx + b by unweighted least squares using finite numeric points."
+        )
+        self.linear_fit_x_min_edit = QLineEdit()
+        self.linear_fit_x_min_edit.setPlaceholderText("All data")
+        self.linear_fit_x_min_edit.setToolTip(
+            "Optional inclusive lower X bound in original data units, unaffected by divisor."
+        )
+        self.linear_fit_x_max_edit = QLineEdit()
+        self.linear_fit_x_max_edit.setPlaceholderText("All data")
+        self.linear_fit_x_max_edit.setToolTip(
+            "Optional inclusive upper X bound in original data units, unaffected by divisor."
+        )
+        self.linear_fit_line_style_combo = self._combo(LINE_STYLES, "dashed")
+        self.linear_fit_line_width_spin = self._double(1.0, 0.1, 10.0, 2)
+        self.linear_fit_result_label = QLabel(
+            "Enable linear fit to calculate the equation, R², and n."
+        )
+        self.linear_fit_result_label.setWordWrap(True)
+        self.linear_fit_result_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.linear_fit_result_label.setToolTip(
+            "Coefficients use original data units, unaffected by divisors or visual Y offsets."
+        )
 
         self.cmap_column_list = QListWidget()
         self.cmap_column_list.setMaximumHeight(80)
@@ -206,8 +249,6 @@ class SeriesSettingsPanel(QGroupBox):
             ("Y offset", self.y_offset_spin),
             ("Color", self.color_button),
             ("Alpha", self.alpha_spin),
-            ("Error column", self.error_combo),
-            ("Error cap size", self.error_cap_spin),
             (None, self.legend_check),
         ):
             if label is None:
@@ -215,6 +256,25 @@ class SeriesSettingsPanel(QGroupBox):
             else:
                 style_form.addRow(label, widget)
         self.tabs.addTab(style_tab, "Style")
+
+        error_tab = QWidget()
+        error_layout = QVBoxLayout(error_tab)
+        error_layout.setContentsMargins(4, 4, 4, 4)
+        error_form = QFormLayout()
+        error_form.addRow("Y error column (±)", self.error_combo)
+        error_form.addRow("Cap size", self.error_cap_spin)
+        error_layout.addLayout(error_form)
+        error_hint = QLabel(
+            "Enter one error magnitude per data row. A numeric cell adds a "
+            "symmetric Y error bar to that row's point; leave a cell blank to "
+            "show the point without an error bar. Error bars inherit the series "
+            "color and alpha. Broken axes are not currently supported."
+        )
+        error_hint.setWordWrap(True)
+        error_hint.setStyleSheet("color: #5b6573; font-size: 11px;")
+        error_layout.addWidget(error_hint)
+        error_layout.addStretch(1)
+        self.tabs.addTab(error_tab, "Error bars")
 
         cmap_tab = QWidget()
         cmap_layout = QVBoxLayout(cmap_tab)
@@ -260,20 +320,37 @@ class SeriesSettingsPanel(QGroupBox):
         cmap_layout.addWidget(self.apply_gradient_button)
         self.tabs.addTab(cmap_tab, "Colormap")
 
-    @staticmethod
-    def _signal(widget: QWidget):
-        for name in ("textChanged", "currentTextChanged", "valueChanged", "toggled"):
-            signal = getattr(widget, name, None)
-            if signal is not None:
-                return signal
-        return None
+        fit_tab = QWidget()
+        fit_layout = QVBoxLayout(fit_tab)
+        fit_layout.setContentsMargins(4, 4, 4, 4)
+        fit_form = QFormLayout()
+        fit_form.addRow(self.linear_fit_enabled_check)
+        fit_form.addRow("X minimum", self.linear_fit_x_min_edit)
+        fit_form.addRow("X maximum", self.linear_fit_x_max_edit)
+        fit_form.addRow("Line style", self.linear_fit_line_style_combo)
+        fit_form.addRow("Line width", self.linear_fit_line_width_spin)
+        fit_layout.addLayout(fit_form)
+        fit_hint = QLabel(
+            "Blank X bounds use all valid data. The fit uses original data units, "
+            "excludes visual Y offsets, and is available on linear numeric axes."
+        )
+        fit_hint.setWordWrap(True)
+        fit_hint.setStyleSheet("color: #5b6573; font-size: 11px;")
+        fit_layout.addWidget(fit_hint)
+        fit_result_box = QGroupBox("Result")
+        fit_result_layout = QVBoxLayout(fit_result_box)
+        fit_result_layout.addWidget(self.linear_fit_result_label)
+        fit_layout.addWidget(fit_result_box)
+        fit_layout.addStretch(1)
+        self.tabs.addTab(fit_tab, "Linear fit")
+
+    _signal = staticmethod(change_signal)
 
     def _build_bindings(self) -> BindingRegistry:
         standard = {
             "label": self.label_edit,
             "y_axis": self.axis_combo,
             "plot_type": self.type_combo,
-            "marker": self.marker_combo,
             "line_style": self.line_style_combo,
             "line_width": self.line_width_spin,
             "marker_size": self.marker_size_spin,
@@ -282,6 +359,9 @@ class SeriesSettingsPanel(QGroupBox):
             "alpha": self.alpha_spin,
             "show_in_legend": self.legend_check,
             "error_cap_size": self.error_cap_spin,
+            "linear_fit_enabled": self.linear_fit_enabled_check,
+            "linear_fit_line_style": self.linear_fit_line_style_combo,
+            "linear_fit_line_width": self.linear_fit_line_width_spin,
         }
         bindings: list[FieldBinding[Any]] = []
         for field, widget in standard.items():
@@ -301,6 +381,27 @@ class SeriesSettingsPanel(QGroupBox):
             signal = None if widget is self.color_button else self._signal(widget)
             bindings.append(FieldBinding(field, widget, read, write, signal))
 
+        # One visual palette controls two persisted fields.  Only the first
+        # binding owns the signal so choosing one grid cell produces one undo
+        # snapshot and one render, while both values still round-trip.
+        bindings.extend(
+            [
+                FieldBinding(
+                    "marker",
+                    self.marker_combo,
+                    self.marker_combo.marker_code,
+                    self.marker_combo.set_marker_code,
+                    self.marker_combo.choiceChanged,
+                ),
+                FieldBinding(
+                    "marker_fill_style",
+                    self.marker_combo,
+                    self.marker_combo.fill_style,
+                    self.marker_combo.set_fill_style,
+                ),
+            ]
+        )
+
         bindings.append(
             FieldBinding(
                 "error_column",
@@ -310,10 +411,32 @@ class SeriesSettingsPanel(QGroupBox):
                 self.error_combo.currentTextChanged,
             )
         )
+        for field, edit in (
+            ("linear_fit_x_min", self.linear_fit_x_min_edit),
+            ("linear_fit_x_max", self.linear_fit_x_max_edit),
+        ):
+            bindings.append(
+                FieldBinding(
+                    field,
+                    edit,
+                    lambda target=edit: self._optional_float(target),
+                    lambda value, target=edit: target.setText(
+                        "" if value is None else str(value)
+                    ),
+                    edit.textChanged,
+                )
+            )
         return BindingRegistry(bindings)
 
     def _connect_local_behaviour(self) -> None:
         self.type_combo.currentTextChanged.connect(self.update_plot_type_help)
+        self.linear_fit_enabled_check.toggled.connect(
+            self.update_linear_fit_control_states
+        )
+        for edit in (self.linear_fit_x_min_edit, self.linear_fit_x_max_edit):
+            edit.textChanged.connect(
+                lambda _text, target=edit: self._refresh_numeric_edit_validity(target)
+            )
         self.cmap_alpha_only_check.toggled.connect(self.set_cmap_mode)
         self.cmap_select_all_button.clicked.connect(self.select_all_cmap_columns)
         self.cmap_select_none_button.clicked.connect(self.clear_cmap_columns)
@@ -323,6 +446,32 @@ class SeriesSettingsPanel(QGroupBox):
                     lambda *_args, source=binding.widget: self.changed.emit(source)
                 )
         self.set_cmap_mode(False)
+        self.update_linear_fit_control_states()
+
+    _optional_float = staticmethod(optional_float)
+
+    @staticmethod
+    def _refresh_numeric_edit_validity(edit: QLineEdit) -> None:
+        valid = SeriesSettingsPanel._numeric_edit_is_valid(edit)
+        edit.setProperty("invalid", not valid)
+        edit.style().unpolish(edit)
+        edit.style().polish(edit)
+
+    @staticmethod
+    def _numeric_edit_is_valid(edit: QLineEdit) -> bool:
+        text = edit.text().strip()
+        if not text:
+            return True
+        try:
+            return math.isfinite(float(text))
+        except ValueError:
+            return False
+
+    def linear_fit_bounds_are_valid(self) -> bool:
+        return all(
+            self._numeric_edit_is_valid(edit)
+            for edit in (self.linear_fit_x_min_edit, self.linear_fit_x_max_edit)
+        )
 
     def _write_error_column(self, value: str) -> None:
         text = str(value or "")
@@ -353,12 +502,26 @@ class SeriesSettingsPanel(QGroupBox):
         if error_columns is not None:
             self.set_error_columns(error_columns)
         self.bindings.load(series)
+        for edit in (self.linear_fit_x_min_edit, self.linear_fit_x_max_edit):
+            self._refresh_numeric_edit_validity(edit)
+        self.update_linear_fit_control_states()
+        self.set_linear_fit_result(None, enabled=series.linear_fit_enabled)
 
     def update_series(self, series: SeriesConfig) -> SeriesConfig:
         """Update and return one config while preserving non-widget fields."""
         if not isinstance(series, SeriesConfig):
             raise TypeError("update_series expects SeriesConfig")
+        previous_fit_bounds = (
+            series.linear_fit_x_min,
+            series.linear_fit_x_max,
+        )
         self.bindings.update(series)
+        for field, edit, previous in (
+            ("linear_fit_x_min", self.linear_fit_x_min_edit, previous_fit_bounds[0]),
+            ("linear_fit_x_max", self.linear_fit_x_max_edit, previous_fit_bounds[1]),
+        ):
+            if not self._numeric_edit_is_valid(edit):
+                setattr(series, field, previous)
         series.label = series.label.strip() or series.y
         return series
 
@@ -388,8 +551,46 @@ class SeriesSettingsPanel(QGroupBox):
         return self.target_combo.currentText()
 
     def set_editor_enabled(self, enabled: bool) -> None:
+        self._editor_enabled = enabled
         for widget in self.bindings.widgets:
             widget.setEnabled(enabled)
+        self.update_linear_fit_control_states()
+        if not enabled:
+            self.linear_fit_result_label.setText("Select a plotted series to view its fit.")
+
+    def update_linear_fit_control_states(self, *_args) -> None:
+        # Keep the range/style fields editable while fitting is off so a user
+        # can configure the fit before enabling it. The whole editor still
+        # follows whether any plotted series is available.
+        enabled = self._editor_enabled
+        for widget in (
+            self.linear_fit_x_min_edit,
+            self.linear_fit_x_max_edit,
+            self.linear_fit_line_style_combo,
+            self.linear_fit_line_width_spin,
+        ):
+            widget.setEnabled(enabled)
+
+    def set_linear_fit_result(
+        self,
+        result: LinearFitResult | None,
+        *,
+        enabled: bool,
+        pending: bool = False,
+    ) -> None:
+        """Show one transient fit result without storing it in project state."""
+
+        if not enabled:
+            text = "Enable linear fit to calculate the equation, R², and n."
+        elif not self.linear_fit_bounds_are_valid():
+            text = "Enter finite numeric X bounds, or leave them blank."
+        elif pending:
+            text = "Calculating linear fit…"
+        elif result is None:
+            text = "Fit unavailable. See Figure issues for details."
+        else:
+            text = result.equation_text()
+        self.linear_fit_result_label.setText(text)
 
     def update_plot_type_help(self, plot_type: str) -> None:
         self.type_help.setText(PLOT_TYPE_HELP.get(plot_type, ""))
