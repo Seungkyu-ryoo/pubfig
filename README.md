@@ -322,3 +322,9 @@ entering a real GUI event loop.
   Export selected figures to save only those graphs as PNG files. Sheet/folder
   selections do not include unselected graphs; existing files are not overwritten.
 - Multi-figure projects, autosave, crash recovery, undo, and redo
+
+## Contributors
+
+- [@Seungkyu-ryoo](https://github.com/Seungkyu-ryoo) — Project author and maintainer.
+- **Claude (Anthropic)** — AI-assisted development.
+- **Codex (OpenAI)** — AI-assisted development.
