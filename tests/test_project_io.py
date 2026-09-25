@@ -180,13 +180,13 @@ class ProjectIoTests(unittest.TestCase):
     def test_v3_round_trip_keeps_shape_annotations_and_empty_selection(self) -> None:
         sheet = Sheet(
             "sh1",
-            "측정값",
+            "Measurements (µA)",
             pd.DataFrame(
                 [["X", "Y"], ["Time", "Signal"], [0, 1]],
                 columns=["X", "Y"],
             ),
         )
-        annotation = AnnotationConfig(kind="text", text="주석", x=0.5, y=1.0)
+        annotation = AnnotationConfig(kind="text", text="Annotation (α)", x=0.5, y=1.0)
         series = SeriesConfig(
             x="X",
             y="Y",
@@ -198,10 +198,10 @@ class ProjectIoTests(unittest.TestCase):
         )
         graph = Graph(
             "gr1",
-            "그래프",
+            "Graph (α)",
             sheet.id,
             PlotConfig(
-                title="결과",
+                title="Results (Δ)",
                 legend_entries=[
                     LegendEntryConfig(
                         label="Group A",
@@ -245,11 +245,11 @@ class ProjectIoTests(unittest.TestCase):
         self.assertEqual(restored_series.error_cap_size, 4.0)
         self.assertEqual(restored_series.marker, "o")
         self.assertEqual(restored_series.marker_fill_style, "left")
-        self.assertEqual(payload["graphs"][0]["plot_config"]["annotations"][0]["text"], "주석")
+        self.assertEqual(payload["graphs"][0]["plot_config"]["annotations"][0]["text"], "Annotation (α)")
         restored_graph = restored.graphs[graph.id]
         self.assertEqual(restored_graph.checked_y, [])
         self.assertIsInstance(restored_graph.annotations[0], AnnotationConfig)
-        self.assertEqual(restored_graph.annotations[0].text, "주석")
+        self.assertEqual(restored_graph.annotations[0].text, "Annotation (α)")
         self.assertEqual(
             restored_graph.plot_config.legend_entries,
             [
@@ -464,7 +464,7 @@ class ProjectIoTests(unittest.TestCase):
         }
         legacy = document_from_payload(payload, "Legacy")
         with tempfile.TemporaryDirectory() as directory:
-            saved_path = write_project(Path(directory) / "결과", legacy)
+            saved_path = write_project(Path(directory) / "Results (Δ)", legacy)
             loaded = read_project(saved_path)
 
             self.assertEqual(saved_path.suffix, ".json")
